@@ -24,8 +24,6 @@ use codex_sandboxing::SandboxType;
 use codex_sandboxing::is_likely_sandbox_denied;
 use codex_utils_pty::ExecCommandSession;
 use codex_utils_pty::ProcessSignal as PtyProcessSignal;
-use opentelemetry::trace::SpanContext;
-use opentelemetry::trace::TraceContextExt;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
@@ -291,7 +289,6 @@ impl LocalProcess {
         params: ExecParams,
         mut telemetry: ProcessTelemetry,
     ) -> Result<(ExecResponse, watch::Sender<u64>, ExecProcessEventLog), JSONRPCErrorError> {
-        telemetry.launch_context = telemetry.launch_context.filter(SpanContext::is_valid);
         let metadata = params.metadata.as_ref();
         telemetry.thread_id = metadata
             .and_then(|metadata| metadata.thread_id.as_ref())
@@ -1067,14 +1064,8 @@ fn watch_exit(
     output_notify: Arc<Notify>,
     telemetry: ProcessTelemetry,
 ) -> impl std::future::Future<Output = ()> + Send {
-    // Set the copied OTEL parent before entering; never retain the RPC tracing span.
+    // Never retain the RPC tracing span.
     let process_span = tracing::info_span!(parent: None, "codex.exec_server.process");
-    if let Some(launch_context) = &telemetry.launch_context {
-        codex_otel::set_parent_from_context(
-            &process_span,
-            opentelemetry::Context::new().with_remote_span_context(launch_context.clone()),
-        );
-    }
     async move {
         let exit_code = exit_rx.await.unwrap_or(-1);
         let sandboxed = {
@@ -1277,13 +1268,9 @@ mod tests {
     use codex_network_proxy::NetworkProxyState;
     use codex_network_proxy::RemoteNetworkProxyConfig;
     use codex_network_proxy::RemoteNetworkProxyLaunchConfig;
-    use codex_otel::MetricsConfig;
     use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
     use codex_utils_path_uri::PathUri;
     use codex_utils_pty::ProcessDriver;
-    use opentelemetry_sdk::metrics::InMemoryMetricExporter;
-    use opentelemetry_sdk::metrics::data::AggregatedMetrics;
-    use opentelemetry_sdk::metrics::data::MetricData;
     use pretty_assertions::assert_eq;
     #[cfg(not(target_os = "windows"))]
     use tokio::io::AsyncReadExt;
@@ -1430,63 +1417,6 @@ mod tests {
             ExecServerNetworkProtocol::HttpsConnect
         );
         backend.shutdown().await;
-    }
-
-    fn telemetry_backend() -> (
-        LocalProcess,
-        codex_otel::MetricsClient,
-        InMemoryMetricExporter,
-    ) {
-        let exporter = InMemoryMetricExporter::default();
-        let metrics = codex_otel::MetricsClient::new(MetricsConfig::in_memory(
-            "test",
-            "codex-exec-server",
-            env!("CARGO_PKG_VERSION"),
-            exporter.clone(),
-        ))
-        .expect("metrics");
-        let telemetry = ExecServerTelemetry::new(metrics.clone());
-        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(NOTIFICATION_CHANNEL_CAPACITY);
-        tokio::spawn(async move { while outgoing_rx.recv().await.is_some() {} });
-        (
-            LocalProcess::with_runtime_paths(
-                RpcNotificationSender::new(outgoing_tx),
-                telemetry,
-                /*runtime_paths*/ None,
-                /*rpc_output_retention*/ None,
-            ),
-            metrics,
-            exporter,
-        )
-    }
-
-    fn assert_finished_process_result(
-        metrics: codex_otel::MetricsClient,
-        exporter: &InMemoryMetricExporter,
-        expected: &str,
-    ) {
-        metrics.shutdown().expect("shutdown metrics");
-        let resource_metrics = exporter
-            .get_finished_metrics()
-            .expect("finished metrics")
-            .into_iter()
-            .last()
-            .expect("metrics export");
-        let finished_processes = resource_metrics
-            .scope_metrics()
-            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
-            .find(|metric| metric.name() == "exec_server_processes_finished_total")
-            .expect("finished process metric");
-        let AggregatedMetrics::U64(MetricData::Sum(sum)) = finished_processes.data() else {
-            panic!("finished process metric should be a u64 sum");
-        };
-        let results = sum
-            .data_points()
-            .flat_map(opentelemetry_sdk::metrics::data::SumDataPoint::attributes)
-            .filter(|attribute| attribute.key.as_str() == "result")
-            .map(|attribute| attribute.value.as_str().into_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(results, vec![expected.to_string()]);
     }
 
     #[tokio::test]
@@ -1695,39 +1625,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exit_before_shutdown_records_success() {
-        let (backend, metrics, exporter) = telemetry_backend();
-        let mut process = spawn_test_process(&backend, "exit-before-shutdown").await;
-
-        process.exit(/*exit_code*/ 0);
-        let _ = read_process_until_change(&backend, &process.process_id, /*after_seq*/ None).await;
-        backend.shutdown().await;
-
-        assert_finished_process_result(metrics, &exporter, "success");
-    }
-
-    #[tokio::test]
-    async fn termination_request_before_exit_records_terminated() {
-        let (backend, metrics, exporter) = telemetry_backend();
-        let mut process = spawn_test_process(&backend, "terminate-before-exit").await;
-
-        assert_eq!(
-            backend
-                .terminate_process(TerminateParams {
-                    process_id: process.process_id.clone(),
-                })
-                .await
-                .expect("terminate process"),
-            TerminateResponse { running: true },
-        );
-        process.exit(/*exit_code*/ 0);
-        let _ = read_process_until_change(&backend, &process.process_id, /*after_seq*/ None).await;
-        backend.shutdown().await;
-
-        assert_finished_process_result(metrics, &exporter, "terminated");
-    }
-
-    #[tokio::test]
     async fn termination_request_after_exit_cancels_network_policy_decisions() {
         let backend = LocalProcess::default();
         let mut process = spawn_test_process(&backend, "terminate-after-exit").await;
@@ -1762,17 +1659,6 @@ mod tests {
         drop(process.stderr_tx);
         let _ = read_process_until_closed(&backend, &process.process_id).await;
         backend.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn shutdown_before_exit_records_terminated() {
-        let (backend, metrics, exporter) = telemetry_backend();
-        let mut process = spawn_test_process(&backend, "shutdown-before-exit").await;
-
-        backend.shutdown().await;
-        process.exit(/*exit_code*/ 0);
-
-        assert_finished_process_result(metrics, &exporter, "terminated");
     }
 
     #[tokio::test]

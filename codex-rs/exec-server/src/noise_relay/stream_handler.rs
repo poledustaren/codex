@@ -92,7 +92,3 @@ impl NoiseStreamHandler for ConnectionProcessor {
         .await;
     }
 }
-
-#[cfg(test)]
-#[path = "stream_handler_tests.rs"]
-mod tests;

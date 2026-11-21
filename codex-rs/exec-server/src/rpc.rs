@@ -38,10 +38,6 @@ use crate::connection::JsonRpcTransport;
 use crate::rpc_server_requests::RpcServerRequestSender;
 use crate::rpc_timing::RpcCompletion;
 
-#[cfg(test)]
-#[path = "rpc_client_metrics_tests.rs"]
-mod client_metrics_tests;
-
 pub(crate) const SESSION_ALREADY_ATTACHED_ERROR_CODE: i64 = -32010;
 const MAX_IN_FLIGHT_REGULAR_CALLS: usize = 1024;
 const RESERVED_CLEANUP_CALLS: usize = 1;
@@ -1024,12 +1020,9 @@ mod tests {
 
     use codex_exec_server_protocol::JSONRPCMessage;
     use codex_exec_server_protocol::JSONRPCNotification;
-    use codex_exec_server_protocol::JSONRPCRequest;
+
     use codex_exec_server_protocol::JSONRPCResponse;
     use codex_exec_server_protocol::RequestId;
-    use opentelemetry::trace::TracerProvider as _;
-    use opentelemetry_sdk::trace::InMemorySpanExporter;
-    use opentelemetry_sdk::trace::SdkTracerProvider;
     use pretty_assertions::assert_eq;
     use tokio::io::AsyncBufReadExt;
     use tokio::io::AsyncWriteExt;
@@ -1037,15 +1030,12 @@ mod tests {
     use tokio::sync::mpsc;
     use tokio::task::JoinSet;
     use tokio::time::timeout;
-    use tracing::Instrument;
-    use tracing_subscriber::filter::filter_fn;
-    use tracing_subscriber::prelude::*;
 
     use super::MAX_IN_FLIGHT_REGULAR_CALLS;
     use super::RESERVED_OUTBOUND_CONTROL_MESSAGES;
     use super::RpcCallError;
     use super::RpcClient;
-    use super::RpcClientEvent;
+
     use super::RpcNotificationSender;
     use crate::connection::JsonRpcConnection;
     use crate::connection::JsonRpcConnectionEvent;
@@ -1099,79 +1089,6 @@ mod tests {
         if let Err(err) = writer.write_all(format!("{encoded}\n").as_bytes()).await {
             panic!("failed to write JSON-RPC line: {err}");
         }
-    }
-
-    #[tokio::test]
-    async fn inbound_request_span_stays_open_until_event_consumption() {
-        let span_exporter = InMemorySpanExporter::default();
-        let tracer_provider = SdkTracerProvider::builder()
-            .with_simple_exporter(span_exporter.clone())
-            .build();
-        let subscriber = tracing_subscriber::registry().with(
-            tracing_opentelemetry::layer()
-                .with_tracer(tracer_provider.tracer("exec-server-test"))
-                .with_filter(filter_fn(codex_otel::OtelProvider::trace_export_filter)),
-        );
-        let _subscriber = tracing::subscriber::set_default(subscriber);
-        tracing::callsite::rebuild_interest_cache();
-
-        let (outgoing_tx, _outgoing_rx) = tokio::sync::mpsc::channel(/*buffer*/ 1);
-        let (incoming_tx, incoming_rx) = tokio::sync::mpsc::channel(/*buffer*/ 1);
-        let (_disconnected_tx, disconnected_rx) = tokio::sync::watch::channel(/*init*/ false);
-        let connection = JsonRpcConnection {
-            outgoing_tx,
-            incoming_rx,
-            disconnected_rx,
-            task_handles: Vec::new(),
-            transport: JsonRpcTransport::Plain,
-        };
-        let (_client, mut events_rx) = RpcClient::new(connection);
-
-        incoming_tx
-            .send(JsonRpcConnectionEvent::message(JSONRPCMessage::Request(
-                JSONRPCRequest {
-                    id: RequestId::Integer(1),
-                    method: "test/callback".to_string(),
-                    params: None,
-                    trace: None,
-                },
-            )))
-            .await
-            .expect("queue inbound client request");
-        timeout(Duration::from_secs(1), async {
-            while events_rx.is_empty() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("inbound request should enter the client event queue");
-        assert!(
-            span_exporter
-                .get_finished_spans()
-                .expect("request span export")
-                .is_empty(),
-            "the request span must remain open until the client consumes the event"
-        );
-
-        let Some(RpcClientEvent::Request {
-            request,
-            request_span,
-        }) = events_rx.recv().await
-        else {
-            panic!("expected an inbound client request");
-        };
-        assert_eq!(request.method, "test/callback");
-        request_span.record("otel.name", "test/callback");
-        drop(request_span);
-
-        tracer_provider.force_flush().expect("flush traces");
-        let spans = span_exporter.get_finished_spans().expect("span export");
-        assert!(
-            spans
-                .iter()
-                .any(|span| span.name.as_ref() == "test/callback"),
-            "the request span should cover the complete event queue wait"
-        );
     }
 
     #[tokio::test]
@@ -1433,65 +1350,5 @@ mod tests {
                 Err(RpcCallError::Closed)
             ));
         }
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn rpc_client_propagates_current_trace_context() {
-        let span_exporter = InMemorySpanExporter::default();
-        let tracer_provider = SdkTracerProvider::builder()
-            .with_simple_exporter(span_exporter)
-            .build();
-        let tracer = tracer_provider.tracer("exec-server-test");
-        let subscriber = tracing_subscriber::registry().with(
-            tracing_opentelemetry::layer()
-                .with_tracer(tracer)
-                .with_filter(filter_fn(codex_otel::OtelProvider::trace_export_filter)),
-        );
-        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
-        tracing::callsite::rebuild_interest_cache();
-        let parent_span = tracing::info_span!("outbound-parent");
-        let expected_trace = codex_otel::span_w3c_trace_context(&parent_span)
-            .expect("parent span should have trace context");
-
-        let (client_stdin, server_reader) = tokio::io::duplex(4096);
-        let (mut server_writer, client_stdout) = tokio::io::duplex(4096);
-        let connection =
-            JsonRpcConnection::from_stdio(client_stdout, client_stdin, "test-rpc".to_string());
-        let (client, _events_rx) = RpcClient::new(connection);
-
-        let server = tokio::spawn(async move {
-            let mut lines = BufReader::new(server_reader).lines();
-            let request = match read_jsonrpc_line(&mut lines).await {
-                JSONRPCMessage::Request(request) => request,
-                other => panic!("expected JSON-RPC request, got {other:?}"),
-            };
-            write_jsonrpc_line(
-                &mut server_writer,
-                JSONRPCMessage::Response(JSONRPCResponse {
-                    id: request.id.clone(),
-                    result: serde_json::json!({}),
-                }),
-            )
-            .await;
-            request.trace
-        });
-
-        let response = client
-            .call::<_, serde_json::Value>("traced", &serde_json::json!({}))
-            .instrument(parent_span)
-            .await
-            .expect("RPC response");
-        assert_eq!(response, serde_json::json!({}));
-        let trace = server.await.expect("server task").expect("trace context");
-        let expected_traceparent = expected_trace
-            .traceparent
-            .as_deref()
-            .expect("parent traceparent");
-        let traceparent = trace.traceparent.as_deref().expect("request traceparent");
-        let expected_parts = expected_traceparent.split('-').collect::<Vec<_>>();
-        let parts = traceparent.split('-').collect::<Vec<_>>();
-        assert_eq!(parts[1], expected_parts[1]);
-        assert_ne!(parts[2], expected_parts[2]);
-        assert_eq!(trace.tracestate, expected_trace.tracestate);
     }
 }

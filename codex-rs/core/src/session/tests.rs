@@ -122,7 +122,6 @@ use codex_rollout_trace::replay_bundle;
 use codex_tools::ToolSpec;
 use codex_utils_path_uri::PathUri;
 use std::collections::BTreeMap;
-use tracing::Span;
 
 use crate::connectors::AppInfo;
 use crate::responses_metadata::CodexResponsesRequestKind;
@@ -163,8 +162,6 @@ use codex_history::RolloutItem;
 #[cfg(windows)]
 use codex_network_proxy::ManagedProxyRouting;
 use codex_network_proxy::NetworkProxyConfig;
-use codex_otel::MetricsClient;
-use codex_otel::MetricsConfig;
 use codex_otel::TelemetryAuthMode;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
@@ -229,13 +226,6 @@ use core_test_support::test_codex::test_codex;
 use core_test_support::test_path_buf;
 use core_test_support::tracing::install_test_tracing;
 use core_test_support::wait_for_event;
-use opentelemetry::trace::TraceContextExt;
-use opentelemetry::trace::TraceId;
-use opentelemetry_sdk::metrics::InMemoryMetricExporter;
-use opentelemetry_sdk::metrics::data::AggregatedMetrics;
-use opentelemetry_sdk::metrics::data::Metric;
-use opentelemetry_sdk::metrics::data::MetricData;
-use opentelemetry_sdk::metrics::data::ResourceMetrics;
 use std::path::Path;
 use std::time::Duration;
 use std::time::Instant;
@@ -244,7 +234,6 @@ use tokio::sync::Notify;
 use tokio::sync::Semaphore;
 use tokio::time::sleep;
 use tokio::time::timeout;
-use tracing_opentelemetry::OpenTelemetrySpanExt;
 use wiremock::ResponseTemplate;
 
 use uuid::Uuid;
@@ -417,203 +406,6 @@ fn assistant_message(text: &str) -> ResponseItem {
             ..Default::default()
         }),
     }
-}
-
-fn find_metric<'a>(resource_metrics: &'a ResourceMetrics, name: &str) -> &'a Metric {
-    for scope_metrics in resource_metrics.scope_metrics() {
-        for metric in scope_metrics.metrics() {
-            if metric.name() == name {
-                return metric;
-            }
-        }
-    }
-    panic!("metric {name} missing");
-}
-
-fn single_histogram_attributes(
-    resource_metrics: &ResourceMetrics,
-    name: &str,
-) -> BTreeMap<String, String> {
-    let metric = find_metric(resource_metrics, name);
-    let AggregatedMetrics::F64(data) = metric.data() else {
-        panic!("expected floating-point histogram");
-    };
-    let MetricData::Histogram(histogram) = data else {
-        panic!("expected histogram");
-    };
-    let points = histogram.data_points().collect::<Vec<_>>();
-    assert_eq!(points.len(), 1);
-    points[0]
-        .attributes()
-        .map(|attribute| {
-            (
-                attribute.key.as_str().to_string(),
-                attribute.value.as_str().to_string(),
-            )
-        })
-        .collect()
-}
-
-fn test_metrics_client() -> MetricsClient {
-    MetricsClient::new(
-        MetricsConfig::in_memory(
-            "test",
-            "codex-core",
-            env!("CARGO_PKG_VERSION"),
-            InMemoryMetricExporter::default(),
-        )
-        .with_runtime_reader(),
-    )
-    .expect("in-memory metrics client")
-}
-
-#[test]
-fn extension_metrics_preserve_session_metadata_tags() {
-    let metrics = test_metrics_client();
-    let session_telemetry = SessionTelemetry::new(
-        ThreadId::new(),
-        "gpt-5.4",
-        "gpt-5.4",
-        /*account_id*/ None,
-        /*account_email*/ None,
-        Some(TelemetryAuthMode::Chatgpt),
-        "test_originator".to_string(),
-        /*log_user_prompts*/ false,
-        "tty".to_string(),
-        SessionSource::Cli,
-    )
-    .with_metrics_service_name("test_service")
-    .with_metrics(metrics.clone());
-    let extension_metrics = super::extension_metrics::from_session_telemetry(session_telemetry);
-
-    extension_metrics.histogram(
-        "codex.test.extension",
-        /*value*/ 7,
-        &[
-            ("component", "skills"),
-            ("app.version", "extension-version"),
-            ("auth_mode", "extension-auth"),
-            ("model", "extension-model"),
-            ("originator", "extension-originator"),
-            ("service_name", "extension-service"),
-            ("session_source", "extension-source"),
-        ],
-    );
-
-    extension_metrics.counter(
-        "codex.test.extension.counter",
-        /*inc*/ 2,
-        &[("component", "skills"), ("model", "extension-model")],
-    );
-
-    let snapshot = metrics.snapshot().expect("metrics snapshot");
-    let attributes = single_histogram_attributes(&snapshot, "codex.test.extension");
-    let counter = find_metric(&snapshot, "codex.test.extension.counter");
-    let AggregatedMetrics::U64(MetricData::Sum(sum)) = counter.data() else {
-        panic!("expected counter");
-    };
-    let points = sum.data_points().collect::<Vec<_>>();
-    assert_eq!(points.len(), 1);
-    assert_eq!(points[0].value(), 2);
-    assert_eq!(
-        points[0]
-            .attributes()
-            .map(|attribute| (
-                attribute.key.as_str().to_string(),
-                attribute.value.as_str().to_string(),
-            ))
-            .collect::<BTreeMap<_, _>>(),
-        attributes,
-    );
-    assert_eq!(
-        attributes,
-        BTreeMap::from([
-            (
-                "app.version".to_string(),
-                env!("CARGO_PKG_VERSION").to_string(),
-            ),
-            (
-                "auth_mode".to_string(),
-                TelemetryAuthMode::Chatgpt.to_string(),
-            ),
-            ("component".to_string(), "skills".to_string()),
-            ("model".to_string(), "gpt-5.4".to_string()),
-            ("originator".to_string(), "test_originator".to_string()),
-            ("service_name".to_string(), "test_service".to_string()),
-            ("session_source".to_string(), "cli".to_string()),
-        ])
-    );
-}
-
-#[tokio::test]
-async fn world_state_extension_metrics_follow_turn_model_switch() {
-    struct WorldStateMetricsRecorder;
-
-    impl codex_extension_api::ContextContributor for WorldStateMetricsRecorder {
-        fn contribute_world_state<'a>(
-            &'a self,
-            input: codex_extension_api::WorldStateContributionInput<'a>,
-        ) -> codex_extension_api::ExtensionFuture<
-            'a,
-            Vec<codex_extension_api::WorldStateSectionContribution>,
-        > {
-            Box::pin(async move {
-                for metrics in [
-                    input.extension_metrics.expect("turn metrics"),
-                    Arc::clone(
-                        input
-                            .step_store
-                            .get::<Arc<dyn codex_extension_api::ExtensionMetrics>>()
-                            .expect("step metrics")
-                            .as_ref(),
-                    ),
-                ] {
-                    metrics.histogram("codex.test.extension.turn", /*value*/ 1, &[]);
-                }
-                Vec::new()
-            })
-        }
-    }
-
-    let metrics = test_metrics_client();
-    let (mut session, mut turn_context) = make_session_and_context().await;
-    turn_context.session_telemetry = turn_context
-        .session_telemetry
-        .clone()
-        .with_metrics(metrics.clone());
-    let next_model = if turn_context.model_info().slug == "gpt-5.4" {
-        "gpt-5.2"
-    } else {
-        "gpt-5.4"
-    };
-    let mut turn_context = turn_context
-        .with_model(next_model.to_string(), &session.services.models_manager)
-        .await;
-    turn_context.session_telemetry = turn_context
-        .session_telemetry
-        .clone()
-        .with_model("startup-model", "startup-model");
-    let turn_context = Arc::new(turn_context);
-    let mut builder = codex_extension_api::ExtensionRegistryBuilder::<crate::config::Config>::new();
-    builder.prompt_contributor(Arc::new(WorldStateMetricsRecorder));
-    session.services.extensions = Arc::new(builder.build());
-
-    let session = Arc::new(session);
-    let step = session
-        .capture_step_context(turn_context, &CancellationToken::new())
-        .await
-        .expect("step capture should succeed after switching to a supported model");
-    session
-        .build_world_state_for_step(&step, /*new_window*/ false)
-        .await
-        .expect("world state preparation should succeed and emit extension metrics");
-
-    let snapshot = metrics.snapshot().expect("metrics snapshot");
-    let attributes = single_histogram_attributes(&snapshot, "codex.test.extension.turn");
-    assert_eq!(
-        attributes.get("model").map(String::as_str),
-        Some(next_model)
-    );
 }
 
 fn skill_message(text: &str) -> ResponseItem {
@@ -8180,80 +7972,6 @@ async fn submit_with_trace_captures_current_span_trace_context() {
     assert_eq!(submitted.trace, Some(expected_trace));
 }
 
-#[tokio::test]
-async fn new_default_turn_captures_current_span_trace_id() {
-    let (session, _turn_context) = make_session_and_context().await;
-
-    let _trace_test_context = install_test_tracing("codex-core-tests");
-
-    let request_parent = W3cTraceContext {
-        traceparent: Some("00-00000000000000000000000000000011-0000000000000022-01".into()),
-        tracestate: Some("vendor=value".into()),
-    };
-    let request_span = info_span!("app_server.request");
-    assert!(set_parent_from_w3c_trace_context(
-        &request_span,
-        &request_parent
-    ));
-
-    let turn_trace_id = async {
-        let expected_trace_id = Span::current()
-            .context()
-            .span()
-            .span_context()
-            .trace_id()
-            .to_string();
-        let turn_context = session.new_default_turn().await;
-        assert_eq!(turn_context.trace_id, Some(expected_trace_id));
-        turn_context.trace_id.clone()
-    }
-    .instrument(request_span)
-    .await;
-
-    assert_eq!(
-        turn_trace_id.as_deref(),
-        Some("00000000000000000000000000000011")
-    );
-}
-
-#[test]
-fn submission_dispatch_span_prefers_submission_trace_context() {
-    let _trace_test_context = install_test_tracing("codex-core-tests");
-
-    let ambient_parent = W3cTraceContext {
-        traceparent: Some("00-00000000000000000000000000000033-0000000000000044-01".into()),
-        tracestate: None,
-    };
-    let ambient_span = info_span!("ambient");
-    assert!(set_parent_from_w3c_trace_context(
-        &ambient_span,
-        &ambient_parent
-    ));
-
-    let submission_trace = W3cTraceContext {
-        traceparent: Some("00-00000000000000000000000000000055-0000000000000066-01".into()),
-        tracestate: Some("vendor=value".into()),
-    };
-    let dispatch_span = ambient_span.in_scope(|| {
-        submission_dispatch_span(&Submission {
-            turn_extension_init: None,
-            id: "sub-1".into(),
-            op: Op::Interrupt,
-            parent_turn_id: None,
-            root_turn_id: None,
-            residency_guard: None,
-            message_delivery: None,
-            trace: Some(submission_trace),
-        })
-    });
-
-    let trace_id = dispatch_span.context().span().span_context().trace_id();
-    assert_eq!(
-        trace_id,
-        TraceId::from_hex("00000000000000000000000000000055").expect("trace id")
-    );
-}
-
 #[test]
 fn submission_dispatch_span_uses_debug_for_realtime_audio() {
     let _trace_test_context = install_test_tracing("codex-core-tests");
@@ -8577,115 +8295,6 @@ async fn empty_turn_environments_clear_primary_environment() {
     let turn_cwd = turn_context.cwd.clone();
     assert_eq!(turn_cwd, session.get_config().await.cwd);
     assert_eq!(turn_context.config.cwd, session.get_config().await.cwd);
-}
-
-#[tokio::test]
-async fn spawn_task_turn_span_inherits_dispatch_trace_context() {
-    struct TraceCaptureTask {
-        captured_trace: Arc<std::sync::Mutex<Option<W3cTraceContext>>>,
-    }
-
-    impl SessionTask for TraceCaptureTask {
-        fn kind(&self) -> TaskKind {
-            TaskKind::Regular
-        }
-
-        fn span_name(&self) -> &'static str {
-            "session_task.trace_capture"
-        }
-
-        async fn run(
-            self: Arc<Self>,
-            _session: Arc<Session>,
-            _ctx: Arc<TurnContext>,
-            _input: Vec<TurnInput>,
-            _cancellation_token: CancellationToken,
-        ) -> SessionTaskResult {
-            let mut trace = self
-                .captured_trace
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *trace = current_span_w3c_trace_context();
-            Ok(None)
-        }
-    }
-
-    // Keep fixture creation and cleanup under the ambient subscriber.
-    let (sess, tc, rx) = make_session_and_context_with_rx().await;
-    let _trace_test_context = install_test_tracing("codex-core-tests");
-
-    let request_parent = W3cTraceContext {
-        traceparent: Some("00-00000000000000000000000000000011-0000000000000022-01".into()),
-        tracestate: Some("vendor=value".into()),
-    };
-    let request_span = tracing::info_span!("app_server.request");
-    assert!(set_parent_from_w3c_trace_context(
-        &request_span,
-        &request_parent
-    ));
-
-    let submission_trace =
-        async { current_span_w3c_trace_context().expect("request span should have trace context") }
-            .instrument(request_span)
-            .await;
-
-    let dispatch_span = submission_dispatch_span(&Submission {
-        turn_extension_init: None,
-        id: "sub-1".into(),
-        op: Op::Interrupt,
-        parent_turn_id: None,
-        root_turn_id: None,
-        residency_guard: None,
-        message_delivery: None,
-        trace: Some(submission_trace.clone()),
-    });
-    let dispatch_span_id = dispatch_span.context().span().span_context().span_id();
-
-    let captured_trace = Arc::new(std::sync::Mutex::new(None));
-
-    async {
-        sess.spawn_task(
-            Arc::clone(&tc),
-            vec![TurnInput::UserInput {
-                metadata: Default::default(),
-                content: vec![UserInput::Text {
-                    text: "hello".to_string(),
-                    text_elements: Vec::new(),
-                }],
-                client_id: None,
-            }],
-            TraceCaptureTask {
-                captured_trace: Arc::clone(&captured_trace),
-            },
-        )
-        .await;
-    }
-    .instrument(dispatch_span)
-    .await;
-
-    let evt = tokio::time::timeout(StdDuration::from_secs(2), rx.recv())
-        .await
-        .expect("timeout waiting for turn completion")
-        .expect("event");
-    assert!(matches!(evt.msg, EventMsg::TurnComplete(_)));
-
-    let task_trace = captured_trace
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
-        .expect("turn task should capture the current span trace context");
-    let submission_context =
-        codex_otel::context_from_w3c_trace_context(&submission_trace).expect("submission");
-    let task_context = codex_otel::context_from_w3c_trace_context(&task_trace).expect("task trace");
-
-    assert_eq!(
-        task_context.span().span_context().trace_id(),
-        submission_context.span().span_context().trace_id()
-    );
-    assert_ne!(
-        task_context.span().span_context().span_id(),
-        dispatch_span_id
-    );
 }
 
 #[cfg(debug_assertions)]

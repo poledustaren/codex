@@ -52,7 +52,6 @@ windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Securit
 
 [dev-dependencies]
 codex-utils-cargo-bin = { workspace = true }
-opentelemetry_sdk = { workspace = true, features = ["testing"] }
 core_test_support = { workspace = true }
 jsonwebtoken = { workspace = true }
 keyring = { workspace = true }

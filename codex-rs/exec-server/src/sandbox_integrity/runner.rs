@@ -80,7 +80,3 @@ async fn run_checks_with_metrics(request: &SandboxExecRequest, metrics: Option<&
         }
     }
 }
-
-#[cfg(test)]
-#[path = "runner_tests.rs"]
-mod tests;

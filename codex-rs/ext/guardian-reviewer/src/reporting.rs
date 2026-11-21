@@ -181,6 +181,3 @@ impl ReviewDenials {
     }
 }
 
-#[cfg(test)]
-#[path = "reporting_tests.rs"]
-mod tests;

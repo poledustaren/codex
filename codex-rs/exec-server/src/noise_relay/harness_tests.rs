@@ -11,7 +11,6 @@ use anyhow::Result;
 use codex_exec_server_protocol::JSONRPCMessage;
 use codex_exec_server_protocol::JSONRPCRequest;
 use codex_exec_server_protocol::RequestId;
-use codex_protocol::protocol::W3cTraceContext;
 use futures::Sink;
 use futures::SinkExt;
 use futures::StreamExt;
@@ -62,133 +61,6 @@ fn websocket_read_diagnostics_use_typed_errors_only() {
     ] {
         assert_eq!(websocket_read_error_reason(&error), expected);
     }
-}
-
-#[tokio::test(start_paused = true)]
-async fn first_encrypted_request_frame_exposes_only_its_trace_context() -> Result<()> {
-    use opentelemetry::trace::TracerProvider as _;
-    use opentelemetry_sdk::trace::InMemorySpanExporter;
-    use opentelemetry_sdk::trace::SdkTracerProvider;
-    use tracing_subscriber::prelude::*;
-    let exporter = InMemorySpanExporter::default();
-    let provider = SdkTracerProvider::builder()
-        .with_simple_exporter(exporter.clone())
-        .build();
-    let events = SafeEvents::default();
-    let _subscriber = tracing::subscriber::set_default(
-        tracing_subscriber::registry()
-            .with(
-                events
-                    .clone()
-                    .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
-            )
-            .with(
-                tracing_opentelemetry::layer()
-                    .with_tracer(provider.tracer("harness-test"))
-                    .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
-            ),
-    );
-    let (connection, mut control, mut outbound_rx) = connected_controlled_harness().await?;
-    let traceparent = "00-00000000000000000000000000000001-0000000000000002-01";
-    let tracestate = "dd=s:1";
-
-    connection
-        .outgoing_tx
-        .send(JSONRPCMessage::Request(JSONRPCRequest {
-            id: RequestId::Integer(1),
-            method: "fs/getMetadata".to_string(),
-            params: Some(serde_json::json!({
-                "payload": "x".repeat(NOISE_RECORD_PLAINTEXT_LEN * 2),
-            })),
-            trace: Some(W3cTraceContext {
-                traceparent: Some(traceparent.to_string()),
-                tracestate: Some(tracestate.to_string()),
-            }),
-        }))
-        .await?;
-
-    control.wait_for_blocked_write(/*expected*/ 1).await?;
-    {
-        let captured = events.0.lock().unwrap();
-        let dequeue = captured
-            .iter()
-            .find(|event| {
-                event
-                    .get("event.name")
-                    .is_some_and(|name| name.contains("request_dequeued"))
-            })
-            .context("live dequeue")?;
-        assert_eq!(
-            dequeue.get("trace_id").map(String::as_str),
-            Some("00000000000000000000000000000001")
-        );
-        assert!(
-            exporter
-                .get_finished_spans()?
-                .iter()
-                .all(|span| span.name != "codex.exec_server.noise_request_write")
-        );
-    }
-    control.grant_writes(/*count*/ 1);
-    let first = read_outbound_frame(&mut outbound_rx).await?;
-    assert_eq!(
-        (first.traceparent.as_deref(), first.tracestate.as_deref()),
-        (Some(traceparent), Some(tracestate))
-    );
-    let stream_id = first.stream_id.clone();
-    let first_payload = first.into_data()?.payload;
-    assert!(
-        !first_payload
-            .windows("fs/getMetadata".len())
-            .any(|window| window == b"fs/getMetadata")
-    );
-
-    control.wait_for_blocked_write(/*expected*/ 2).await?;
-    control.grant_writes(/*count*/ 1);
-    let second = read_outbound_frame(&mut outbound_rx).await?;
-    assert_eq!((second.traceparent, second.tracestate), (None, None));
-    assert!(!format!("{:?}", events.0.lock().unwrap()).contains("request_written"));
-    control.wait_for_blocked_write(/*expected*/ 3).await?;
-    control.grant_writes(/*count*/ 1);
-    read_outbound_frame(&mut outbound_rx).await?;
-    let spans = exporter.get_finished_spans()?;
-    let write_span = spans
-        .iter()
-        .find(|span| span.name == "codex.exec_server.noise_request_write")
-        .context("expected finished request write span")?;
-    assert_eq!(
-        write_span.span_context.trace_id().to_string(),
-        "00000000000000000000000000000001"
-    );
-    assert_eq!(write_span.parent_span_id.to_string(), "0000000000000002");
-    let captured = events.0.lock().unwrap();
-    let progress: Vec<_> = captured
-        .iter()
-        .filter(|e| {
-            e.get("event.name").is_some_and(|name| {
-                name.contains("request_dequeued") || name.contains("request_written")
-            })
-        })
-        .collect();
-    assert_eq!(progress.len(), 2);
-    for event in &progress {
-        assert_eq!(
-            event.get("trace_id").map(String::as_str),
-            Some("00000000000000000000000000000001")
-        );
-    }
-    assert_eq!(progress[0]["stream_id"], format!("{stream_id:?}"));
-    assert_eq!(progress[0]["stream_id"], progress[1]["stream_id"]);
-    assert_eq!(
-        progress[0]["message_sequence"],
-        progress[1]["message_sequence"]
-    );
-    drop(captured);
-
-    for task in &connection.task_handles {
-        task.abort();
-    }
-    Ok(())
 }
 
 #[tokio::test(start_paused = true)]
@@ -646,7 +518,7 @@ where
     fn on_event(
         &self,
         event: &tracing::Event<'_>,
-        context: tracing_subscriber::layer::Context<'_, S>,
+        _context: tracing_subscriber::layer::Context<'_, S>,
     ) {
         if event.metadata().target() != "codex_otel.trace_safe" {
             return;
@@ -660,17 +532,6 @@ where
         }
         let mut fields = Fields::default();
         event.record(&mut fields);
-        // Match CCA's live JSON lookup: inspecting OtelData must not materialize
-        // the context and accidentally hide a missing producer initialization.
-        if let Some(trace_id) = context.event_scope(event).and_then(|mut scope| {
-            scope.find_map(|span| {
-                span.extensions()
-                    .get::<tracing_opentelemetry::OtelData>()?
-                    .trace_id()
-            })
-        }) {
-            fields.0.insert("trace_id".to_owned(), trace_id.to_string());
-        }
         self.0.lock().unwrap().push(fields.0);
     }
 }

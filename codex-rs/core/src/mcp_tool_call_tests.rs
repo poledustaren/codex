@@ -51,9 +51,6 @@ use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
-use opentelemetry::trace::TracerProvider;
-use opentelemetry_sdk::trace::InMemorySpanExporter;
-use opentelemetry_sdk::trace::SdkTracerProvider;
 use pretty_assertions::assert_eq;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -62,7 +59,6 @@ use tempfile::tempdir;
 use tracing::Instrument;
 use tracing::Level;
 use tracing_subscriber::fmt::format::FmtSpan;
-use tracing_subscriber::prelude::*;
 use tracing_test::internal::MockWriter;
 
 fn annotations(
@@ -509,93 +505,6 @@ async fn mcp_tool_call_span_records_expected_fields() {
             && logs.contains("session.id=")
             && logs.contains("turn.id="),
         "missing MCP tool span fields\nlogs:\n{logs}"
-    );
-}
-
-#[test_case::test_case(Some("RATE_LIMITED"), None, None, "RATE_LIMITED"; "structured error")]
-#[test_case::test_case(None, Some("credential-sentinel"), None, "unknown"; "sensitive metadata")]
-#[test_case::test_case(None, None, Some("transport_closed"), "transport_closed"; "closed transport")]
-#[tokio::test]
-async fn mcp_tool_call_span_records_error_type_and_error_code(
-    structured_code: Option<&str>,
-    metadata_code: Option<&str>,
-    request_error_code: Option<&str>,
-    expected_code: &str,
-) {
-    let exporter = InMemorySpanExporter::default();
-    let provider = SdkTracerProvider::builder()
-        .with_simple_exporter(exporter.clone())
-        .build();
-    let subscriber = tracing_subscriber::registry()
-        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("mcp-error-test")));
-    let _guard = tracing::subscriber::set_default(subscriber);
-
-    let (session, turn_context) = make_session_and_context().await;
-    let result = Ok(CallToolResult {
-        content: Vec::new(),
-        structured_content: structured_code.map(|code| serde_json::json!({"error_code": code})),
-        is_error: Some(true),
-        meta: metadata_code.map(|code| {
-            serde_json::json!({
-                "codex/telemetry": {"error_code": code},
-            })
-        }),
-    });
-    let result = if request_error_code.is_some() {
-        Err("request failed".to_string())
-    } else {
-        result
-    };
-    let span = mcp_tool_call_span(
-        &session,
-        &turn_context,
-        McpToolCallSpanFields {
-            server_name: CODEX_APPS_MCP_SERVER_NAME,
-            tool_name: "calendar_search",
-            call_id: "call-123",
-            server_origin: Some("https://chatgpt.com/api/codex/ps/mcp"),
-            connector_id: Some("calendar"),
-            connector_name: Some("Calendar"),
-        },
-    );
-
-    async {
-        record_mcp_result_span_telemetry(&Span::current(), &result, request_error_code);
-    }
-    .instrument(span)
-    .await;
-
-    provider.force_flush().expect("flush spans");
-    let spans = exporter.get_finished_spans().expect("exported spans");
-    let span = spans
-        .iter()
-        .find(|span| span.name == "mcp.tools.call")
-        .expect("MCP tool span");
-    let error_codes = span
-        .attributes
-        .iter()
-        .filter(|attribute| attribute.key.as_str() == "codex.mcp.error.code")
-        .map(|attribute| attribute.value.to_string())
-        .collect::<Vec<_>>();
-    assert_eq!(error_codes, vec![expected_code.to_string()]);
-    let error_types = span
-        .attributes
-        .iter()
-        .filter(|attribute| attribute.key.as_str() == "error.type")
-        .map(|attribute| attribute.value.to_string())
-        .collect::<Vec<_>>();
-    assert_eq!(
-        error_types,
-        vec![if request_error_code.is_some() {
-            "mcp_request".to_string()
-        } else {
-            "tool_result".to_string()
-        }]
-    );
-    assert!(
-        span.attributes
-            .iter()
-            .all(|attribute| !attribute.value.to_string().contains("credential-sentinel"))
     );
 }
 

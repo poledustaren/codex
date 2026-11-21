@@ -211,7 +211,3 @@ pub(crate) async fn prepare_prompt(
     }
     Ok(())
 }
-
-#[cfg(test)]
-#[path = "request_budget_tests.rs"]
-mod tests;

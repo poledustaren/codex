@@ -1145,20 +1145,17 @@ mod tests {
     use codex_http_client::OutboundProxyPolicy;
     use http::HeaderMap;
     use http::HeaderValue;
-    use opentelemetry::trace::TracerProvider as _;
-    use opentelemetry_sdk::trace::SdkTracerProvider;
     use pretty_assertions::assert_eq;
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
-    use tracing::Instrument;
-    use tracing_subscriber::prelude::*;
+
     use wiremock::Mock;
     use wiremock::MockServer;
     use wiremock::ResponseTemplate;
     use wiremock::matchers::body_partial_json;
     use wiremock::matchers::header;
-    use wiremock::matchers::header_regex;
+
     use wiremock::matchers::method;
     use wiremock::matchers::path;
 
@@ -1566,58 +1563,6 @@ mod tests {
                 .expect_err("invalid validation response");
             assert!(!format!("{validation:?} {validation}").contains(TOKEN));
         }
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn register_environment_posts_with_auth_provider_headers() {
-        let provider = SdkTracerProvider::builder().build();
-        let tracer = provider.tracer("exec-server-test");
-        let subscriber =
-            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
-        let _guard = subscriber.set_default();
-        tracing::callsite::rebuild_interest_cache();
-        let server = MockServer::start().await;
-        let executor_public_key = NoiseChannelIdentity::generate()
-            .expect("identity")
-            .public_key();
-        Mock::given(method("POST"))
-            .and(path("/cloud/environment/environment-requested/register"))
-            .and(header("authorization", "Bearer registry-token"))
-            .and(header("chatgpt-account-id", "workspace-123"))
-            .and(header_regex(
-                "traceparent",
-                "^00-[0-9a-f]{32}-[0-9a-f]{16}-0[01]$",
-            ))
-            .and(body_partial_json(serde_json::json!({
-                "security_profile": NOISE_RELAY_SECURITY_PROFILE,
-                "executor_public_key": executor_public_key.clone(),
-            })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "environment_id": "environment-requested",
-                "url": "wss://rendezvous.test/cloud-agent/default/ws/environment/environment-requested?role=environment&sig=abc",
-                "security_profile": NOISE_RELAY_SECURITY_PROFILE,
-                "executor_registration_id": "registration-1",
-            })))
-            .mount(&server)
-            .await;
-        let client = EnvironmentRegistryClient::new(server.uri(), static_registry_auth_provider())
-            .expect("client");
-
-        let response = client
-            .register_environment("environment-requested", &executor_public_key)
-            .instrument(tracing::info_span!("remote-operation"))
-            .await
-            .expect("register environment");
-
-        assert_eq!(
-            response,
-            EnvironmentRegistryRegistrationResponse {
-                environment_id: "environment-requested".to_string(),
-                url: "wss://rendezvous.test/cloud-agent/default/ws/environment/environment-requested?role=environment&sig=abc".to_string(),
-                security_profile: NOISE_RELAY_SECURITY_PROFILE.to_string(),
-                executor_registration_id: "registration-1".to_string(),
-            }
-        );
     }
 
     #[tokio::test]

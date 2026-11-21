@@ -12,6 +12,7 @@ pub(crate) mod validation;
 use crate::config::StatsigMetricsSettings;
 pub use crate::metrics::buffered::record_global_operation;
 pub use crate::metrics::client::MetricsClient;
+pub use crate::metrics::client::MetricsSnapshot;
 pub use crate::metrics::config::MetricsConfig;
 pub use crate::metrics::config::MetricsExporter;
 pub use crate::metrics::error::MetricsError;

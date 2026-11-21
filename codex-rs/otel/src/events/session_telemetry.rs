@@ -10,6 +10,7 @@ use crate::metrics::MULTI_AGENT_SPAWN_PHASE_DURATION_METRIC;
 use crate::metrics::MetricsClient;
 use crate::metrics::MetricsConfig;
 use crate::metrics::MetricsError;
+use crate::metrics::MetricsSnapshot;
 use crate::metrics::PLUGIN_INSTALL_ELICITATION_SENT_METRIC;
 use crate::metrics::PLUGIN_INSTALL_SUGGESTION_METRIC;
 use crate::metrics::RESPONSES_API_ENGINE_IAPI_TBT_DURATION_METRIC;
@@ -58,7 +59,6 @@ use codex_protocol::protocol::TokenUsage;
 use codex_protocol::user_input::UserInput;
 use eventsource_stream::Event as StreamEvent;
 use eventsource_stream::EventStreamError as StreamError;
-use opentelemetry_sdk::metrics::data::ResourceMetrics;
 use reqwest::Error;
 use reqwest::Response;
 use std::future::Future;
@@ -535,7 +535,7 @@ impl SessionTelemetry {
         metrics.shutdown()
     }
 
-    pub fn snapshot_metrics(&self) -> MetricsResult<ResourceMetrics> {
+    pub fn snapshot_metrics(&self) -> MetricsResult<MetricsSnapshot> {
         let Some(metrics) = &self.metrics else {
             return Err(MetricsError::ExporterDisabled);
         };
@@ -554,18 +554,9 @@ impl SessionTelemetry {
 
     /// Collect a runtime metrics summary if debug snapshots are available.
     pub fn runtime_metrics_summary(&self) -> Option<RuntimeMetricsSummary> {
-        let snapshot = match self.snapshot_metrics() {
-            Ok(snapshot) => snapshot,
-            Err(_) => {
-                return None;
-            }
-        };
-        let summary = RuntimeMetricsSummary::from_snapshot(&snapshot);
-        if summary.is_empty() {
-            None
-        } else {
-            Some(summary)
-        }
+        self.snapshot_metrics().ok()?;
+        // Nothing is aggregated, so the summary is always empty.
+        None
     }
 
     fn tags_with_metadata<'a>(

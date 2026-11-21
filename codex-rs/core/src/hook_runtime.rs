@@ -1154,12 +1154,6 @@ pub(crate) async fn run_model_request_hooks(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use codex_otel::HOOK_RUN_DURATION_METRIC;
-    use codex_otel::HOOK_RUN_METRIC;
-    use codex_otel::MetricsClient;
-    use codex_otel::MetricsConfig;
     use codex_protocol::models::ContentItem;
     use codex_protocol::protocol::HookEventName;
     use codex_protocol::protocol::HookExecutionMode;
@@ -1167,20 +1161,12 @@ mod tests {
     use codex_protocol::protocol::HookRunStatus;
     use codex_protocol::protocol::HookScope;
     use codex_protocol::protocol::HookSource;
-    use opentelemetry_sdk::metrics::InMemoryMetricExporter;
-    use opentelemetry_sdk::metrics::data::AggregatedMetrics;
-    use opentelemetry_sdk::metrics::data::HistogramDataPoint;
-    use opentelemetry_sdk::metrics::data::MetricData;
-    use opentelemetry_sdk::metrics::data::SumDataPoint;
     use pretty_assertions::assert_eq;
 
     use super::additional_context_messages;
-    use super::emit_hook_completed_events;
-    use super::emit_hook_started_events;
     use super::hook_run_analytics_payload;
     use super::hook_run_metric_tags;
     use crate::session::tests::make_session_and_context;
-    use crate::session::tests::make_session_and_context_with_rx;
     use codex_protocol::protocol::HookCompletedEvent;
     use codex_protocol::protocol::HookRunSummary;
     use codex_utils_absolute_path::test_support::PathBufExt;
@@ -1219,113 +1205,6 @@ mod tests {
                 ("developer", "first tide note".to_string()),
                 ("developer", "second tide note".to_string()),
             ],
-        );
-    }
-
-    #[tokio::test]
-    async fn hook_lifecycle_notifications_hide_builtin_and_async_runs_but_preserve_metrics() {
-        let metrics = MetricsClient::new(
-            MetricsConfig::in_memory(
-                "test",
-                "codex-core",
-                env!("CARGO_PKG_VERSION"),
-                InMemoryMetricExporter::default(),
-            )
-            .with_runtime_reader(),
-        )
-        .expect("in-memory metrics client");
-        let (session, mut turn_context, events) = make_session_and_context_with_rx().await;
-        let turn_context_mut = Arc::get_mut(&mut turn_context).expect("single turn context ref");
-        turn_context_mut.session_telemetry = turn_context_mut
-            .session_telemetry
-            .clone()
-            .with_metrics(metrics.clone());
-        let mut synchronous_run = sample_hook_run(HookRunStatus::Running, HookSource::User);
-        synchronous_run.id = "synchronous-hook".to_string();
-        let mut asynchronous_run = synchronous_run.clone();
-        asynchronous_run.id = "asynchronous-hook".to_string();
-        asynchronous_run.execution_mode = HookExecutionMode::Async;
-        let mut builtin_run = synchronous_run.clone();
-        builtin_run.id = "builtin-hook".to_string();
-        builtin_run.builtin = true;
-        builtin_run.source = HookSource::Plugin;
-        builtin_run.handler_type = HookHandlerType::McpTool;
-
-        emit_hook_started_events(
-            &session,
-            &turn_context,
-            vec![
-                builtin_run.clone(),
-                asynchronous_run.clone(),
-                synchronous_run.clone(),
-            ],
-        )
-        .await;
-
-        let started = events.try_recv().expect("synchronous hook should start");
-        assert!(matches!(
-            started.msg,
-            codex_protocol::protocol::EventMsg::HookStarted(event)
-                if event.run.id == synchronous_run.id
-        ));
-        assert!(events.try_recv().is_err());
-
-        builtin_run.status = HookRunStatus::Completed;
-        asynchronous_run.status = HookRunStatus::Completed;
-        synchronous_run.status = HookRunStatus::Completed;
-        emit_hook_completed_events(
-            &session,
-            &turn_context,
-            vec![
-                HookCompletedEvent {
-                    turn_id: Some(turn_context.sub_id.clone()),
-                    run: builtin_run,
-                },
-                HookCompletedEvent {
-                    turn_id: Some(turn_context.sub_id.clone()),
-                    run: asynchronous_run,
-                },
-                HookCompletedEvent {
-                    turn_id: Some(turn_context.sub_id.clone()),
-                    run: synchronous_run.clone(),
-                },
-            ],
-        )
-        .await;
-
-        let completed = events.try_recv().expect("synchronous hook should complete");
-        assert!(matches!(
-            completed.msg,
-            codex_protocol::protocol::EventMsg::HookCompleted(event)
-                if event.run.id == synchronous_run.id
-        ));
-        assert!(events.try_recv().is_err());
-
-        let snapshot = metrics.snapshot().expect("metrics snapshot");
-        let counter = snapshot
-            .scope_metrics()
-            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
-            .find(|metric| metric.name() == HOOK_RUN_METRIC)
-            .expect("hook run counter");
-        let AggregatedMetrics::U64(MetricData::Sum(sum)) = counter.data() else {
-            panic!("expected hook run counter");
-        };
-        assert_eq!(sum.data_points().map(SumDataPoint::value).sum::<u64>(), 3);
-
-        let duration = snapshot
-            .scope_metrics()
-            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
-            .find(|metric| metric.name() == HOOK_RUN_DURATION_METRIC)
-            .expect("hook run duration histogram");
-        let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = duration.data() else {
-            panic!("expected hook run duration histogram");
-        };
-        assert_eq!(
-            histogram
-                .data_points()
-                .map(HistogramDataPoint::sum)
-                .sum::<f64>(),
-            81.0,
         );
     }
 

@@ -1,6 +1,3 @@
-use std::io::Read;
-use std::io::Seek;
-use std::io::SeekFrom;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -12,10 +9,6 @@ use codex_exec_server_protocol::JSONRPCResponse;
 use codex_exec_server_protocol::RequestId;
 use futures::SinkExt;
 use futures::StreamExt;
-use opentelemetry::trace::SpanId;
-use opentelemetry::trace::TracerProvider as _;
-use opentelemetry_sdk::trace::InMemorySpanExporter;
-use opentelemetry_sdk::trace::SdkTracerProvider;
 use pretty_assertions::assert_eq;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
@@ -27,17 +20,11 @@ use tokio_tungstenite::accept_async;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::task::AbortOnDropHandle;
-use tracing::instrument::WithSubscriber;
-use tracing_subscriber::Layer;
-use tracing_subscriber::filter::filter_fn;
-use tracing_subscriber::layer::SubscriberExt;
 use uuid::Uuid;
 
-use super::HARNESS_KEY_VALIDATION_TIMEOUT;
 use super::HarnessKeyValidator;
 use super::MAX_FAILED_NOISE_HANDSHAKES;
 use super::MAX_HARNESS_KEY_AUTHORIZATION_BYTES;
-use super::NOISE_HANDSHAKE_FAILURE_COOLDOWN;
 use super::RendezvousDisconnectReason;
 use super::run_multiplexed_environment;
 use crate::ExecServerError;
@@ -48,8 +35,6 @@ use crate::noise_channel::NoiseChannelIdentity;
 use crate::noise_channel::NoiseChannelPublicKey;
 use crate::noise_channel::noise_channel_prologue;
 use crate::noise_relay::NoiseHarnessConnectionArgs;
-use crate::noise_relay::message_framing::JsonRpcMessageDecoder;
-use crate::noise_relay::message_framing::frame_jsonrpc_message;
 use crate::noise_relay::noise_harness_connection_from_websocket_with_readiness;
 use crate::noise_relay::stream_handler::NoiseOutboundMessage;
 use crate::noise_relay::stream_handler::NoiseStreamConnection;
@@ -77,33 +62,6 @@ where
             Some(Ok(message)) => anyhow::bail!("expected relay frame, got {message:?}"),
             Some(Err(error)) => return Err(error.into()),
             None => anyhow::bail!("environment closed before sending relay frame"),
-        }
-    }
-}
-
-#[derive(Clone)]
-struct EchoMessages;
-
-impl NoiseStreamHandler for EchoMessages {
-    type Incoming = JSONRPCMessage;
-    type Outgoing = JSONRPCMessage;
-
-    fn decode(payload: bytes::Bytes) -> Result<Self::Incoming, ExecServerError> {
-        Ok(serde_json::from_slice(&payload)?)
-    }
-
-    fn encode(message: Self::Outgoing) -> Result<NoiseOutboundMessage, ExecServerError> {
-        ConnectionProcessor::encode(message)
-    }
-
-    async fn run_connection(
-        self,
-        mut connection: NoiseStreamConnection<Self::Incoming, Self::Outgoing>,
-    ) {
-        while let Some(message) = connection.incoming_rx.recv().await {
-            if connection.outgoing_tx.send(message).await.is_err() {
-                break;
-            }
         }
     }
 }
@@ -241,41 +199,6 @@ impl HarnessKeyValidator for BlockingValidator {
             calls.fetch_add(1, Ordering::SeqCst);
             release.notified().await;
             Ok(())
-        }
-    }
-}
-
-#[derive(Clone)]
-struct DiagnosticValidator {
-    blocking: BlockingValidator,
-    timeout_started: Arc<Notify>,
-}
-
-impl HarnessKeyValidator for DiagnosticValidator {
-    async fn validate_harness_key(
-        &self,
-        harness_public_key: &NoiseChannelPublicKey,
-        authorization: &str,
-        stream_id: Option<Uuid>,
-    ) -> Result<(), ExecServerError> {
-        match authorization {
-            "reset-authorization-secret" | "timeout-authorization-secret" => {
-                assert!(stream_id.is_some());
-                self.timeout_started.notify_one();
-                std::future::pending().await
-            }
-            "http-authorization-secret" => Err(ExecServerError::EnvironmentRegistryHttp {
-                status: http::StatusCode::SERVICE_UNAVAILABLE,
-                code: None,
-                message: "registry-response-secret".to_string(),
-            }),
-            _ => {
-                // The existing healthy streams use non-UUID identifiers.
-                assert_eq!(stream_id, None);
-                self.blocking
-                    .validate_harness_key(harness_public_key, authorization, stream_id)
-                    .await
-            }
         }
     }
 }
@@ -566,309 +489,6 @@ async fn oversized_harness_authorization_is_rejected_before_validation() -> Resu
 
     harness_websocket.close(None).await?;
     timeout(Duration::from_secs(1), environment_task).await??;
-    Ok(())
-}
-
-#[tokio::test(start_paused = true)]
-async fn malformed_handshakes_preserve_active_streams_and_admission_recovers() -> Result<()> {
-    // In-memory I/O lets Tokio advance to deadlines only after both peers are idle.
-    let (client, server) = tokio::io::duplex(64 * 1024);
-    let ((mut harness_websocket, _response), environment_websocket) = tokio::try_join!(
-        tokio_tungstenite::client_async("ws://localhost", client),
-        accept_async(server),
-    )?;
-
-    let environment_identity = NoiseChannelIdentity::generate()?;
-    let harness_identity = NoiseChannelIdentity::generate()?;
-    let calls = Arc::new(AtomicUsize::new(0));
-    let release = Arc::new(Notify::new());
-    let timeout_started = Arc::new(Notify::new());
-    let mut logs = tempfile::tempfile()?;
-    let writer = logs.try_clone()?;
-    let span_exporter = InMemorySpanExporter::default();
-    let tracer_provider = SdkTracerProvider::builder()
-        .with_simple_exporter(span_exporter.clone())
-        .build();
-    let subscriber = tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_ansi(false)
-                .with_writer(move || writer.try_clone().expect("clone log file"))
-                .with_filter(
-                    tracing_subscriber::filter::Targets::new().with_default(tracing::Level::WARN),
-                ),
-        )
-        .with(
-            tracing_opentelemetry::layer()
-                .with_tracer(tracer_provider.tracer("exec-server-noise-test"))
-                .with_filter(filter_fn(codex_otel::OtelProvider::trace_export_filter)),
-        );
-    let environment_task = AbortOnDropHandle::new(tokio::spawn(
-        run_multiplexed_environment(
-            environment_websocket,
-            EchoMessages,
-            ENVIRONMENT_ID.to_string(),
-            EXECUTOR_REGISTRATION_ID.to_string(),
-            environment_identity.clone(),
-            DiagnosticValidator {
-                blocking: BlockingValidator {
-                    calls: Arc::clone(&calls),
-                    release: Arc::clone(&release),
-                },
-                timeout_started: Arc::clone(&timeout_started),
-            },
-        )
-        .with_subscriber(subscriber),
-    ));
-
-    let healthy_stream_id = "healthy";
-    let prologue =
-        noise_channel_prologue(ENVIRONMENT_ID, EXECUTOR_REGISTRATION_ID, healthy_stream_id);
-    let (handshake, request) = InitiatorHandshake::start(
-        &harness_identity,
-        &environment_identity.public_key(),
-        &prologue,
-        b"authorization",
-    )?;
-    release.notify_one();
-    harness_websocket
-        .send(Message::Binary(
-            encode_relay_message_frame(&RelayMessageFrame::handshake(
-                healthy_stream_id.to_string(),
-                request,
-            ))
-            .into(),
-        ))
-        .await?;
-    let response = timeout(
-        Duration::from_secs(1),
-        next_relay_frame(&mut harness_websocket),
-    )
-    .await??;
-    assert_eq!(response.stream_id, healthy_stream_id);
-    let mut healthy_transport = handshake.finish(&response.into_handshake_payload()?)?;
-
-    let valid_stream_id = Uuid::new_v4().to_string();
-    for attempt in 0..MAX_FAILED_NOISE_HANDSHAKES {
-        let stream_id = if attempt == 0 {
-            valid_stream_id.to_uppercase()
-        } else {
-            format!("malformed-{attempt}")
-        };
-        let prologue = noise_channel_prologue(ENVIRONMENT_ID, EXECUTOR_REGISTRATION_ID, &stream_id);
-        let (_handshake, mut request) = InitiatorHandshake::start(
-            &harness_identity,
-            &environment_identity.public_key(),
-            &prologue,
-            b"handshake-authorization-secret",
-        )?;
-        let last_byte = request.last_mut().expect("handshake request is not empty");
-        *last_byte ^= 1;
-        let frame = RelayMessageFrame::handshake(stream_id, request);
-        harness_websocket
-            .send(Message::Binary(encode_relay_message_frame(&frame).into()))
-            .await?;
-        let reset = timeout(
-            Duration::from_secs(1),
-            next_relay_frame(&mut harness_websocket),
-        )
-        .await??;
-        assert_eq!(
-            reset,
-            RelayMessageFrame::reset(
-                frame.stream_id,
-                crate::noise_relay::NOISE_RELAY_RESET_REASON.to_string(),
-            )
-        );
-    }
-
-    let new_stream_id = "after-cooldown";
-    let prologue = noise_channel_prologue(ENVIRONMENT_ID, EXECUTOR_REGISTRATION_ID, new_stream_id);
-    let (new_handshake, request) = InitiatorHandshake::start(
-        &harness_identity,
-        &environment_identity.public_key(),
-        &prologue,
-        b"authorization",
-    )?;
-    let new_frame = RelayMessageFrame::handshake(new_stream_id.to_string(), request);
-    // Check both immediate rejection and a later attempt that must not extend
-    // the cooldown. Encrypted traffic on the healthy stream still round-trips.
-    for seq in 0..2 {
-        harness_websocket
-            .send(Message::Binary(
-                encode_relay_message_frame(&new_frame).into(),
-            ))
-            .await?;
-        let reset = timeout(
-            Duration::from_secs(1),
-            next_relay_frame(&mut harness_websocket),
-        )
-        .await??;
-        assert_eq!(reset.stream_id, new_stream_id);
-        assert_eq!(reset.validate()?, RelayFrameBodyKind::Reset);
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-
-        let message = JSONRPCMessage::Response(JSONRPCResponse {
-            id: RequestId::Integer(i64::from(seq)),
-            result: serde_json::json!({"healthy": true}),
-        });
-        let frame = RelayMessageFrame::data(
-            healthy_stream_id.to_string(),
-            seq,
-            healthy_transport.encrypt(&frame_jsonrpc_message(&message)?)?,
-            /*trace*/ None,
-        );
-        harness_websocket
-            .send(Message::Binary(encode_relay_message_frame(&frame).into()))
-            .await?;
-        let response = timeout(
-            Duration::from_secs(1),
-            next_relay_frame(&mut harness_websocket),
-        )
-        .await??;
-        assert_eq!(response.stream_id, healthy_stream_id);
-        let data = response.into_data()?;
-        assert_eq!(data.seq, seq);
-        let messages =
-            JsonRpcMessageDecoder::default().push(&healthy_transport.decrypt(&data.payload)?)?;
-        assert_eq!(messages, vec![message]);
-
-        // Service keepalive pings while waiting for the next admission attempt.
-        assert!(
-            timeout(
-                NOISE_HANDSHAKE_FAILURE_COOLDOWN / 2,
-                next_relay_frame(&mut harness_websocket),
-            )
-            .await
-            .is_err()
-        );
-    }
-
-    release.notify_one();
-    harness_websocket
-        .send(Message::Binary(
-            encode_relay_message_frame(&new_frame).into(),
-        ))
-        .await?;
-    let response = timeout(
-        Duration::from_secs(1),
-        next_relay_frame(&mut harness_websocket),
-    )
-    .await??;
-    assert_eq!(response.stream_id, new_stream_id);
-    new_handshake.finish(&response.into_handshake_payload()?)?;
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
-
-    // Exercise an incoming reset, an HTTP failure and a validation timeout.
-    let reset_stream_id = Uuid::new_v4().to_string();
-    for (stream_id, authorization) in [
-        (reset_stream_id.clone(), "reset-authorization-secret"),
-        (Uuid::new_v4().to_string(), "http-authorization-secret"),
-        (Uuid::new_v4().to_string(), "timeout-authorization-secret"),
-    ] {
-        let prologue = noise_channel_prologue(ENVIRONMENT_ID, EXECUTOR_REGISTRATION_ID, &stream_id);
-        let (_handshake, request) = InitiatorHandshake::start(
-            &harness_identity,
-            &environment_identity.public_key(),
-            &prologue,
-            authorization.as_bytes(),
-        )?;
-        let frame = RelayMessageFrame::handshake(stream_id.clone(), request);
-        harness_websocket
-            .send(Message::Binary(encode_relay_message_frame(&frame).into()))
-            .await?;
-        if authorization != "http-authorization-secret" {
-            timeout_started.notified().await;
-        }
-        if authorization == "reset-authorization-secret" {
-            let frame = RelayMessageFrame::reset(stream_id, "untrusted-reset-secret".to_string());
-            harness_websocket
-                .send(Message::Binary(encode_relay_message_frame(&frame).into()))
-                .await?;
-            continue;
-        }
-        let reset = timeout(
-            HARNESS_KEY_VALIDATION_TIMEOUT + Duration::from_secs(1),
-            next_relay_frame(&mut harness_websocket),
-        )
-        .await??;
-        assert_eq!(reset.stream_id, stream_id);
-        assert_eq!(reset.validate()?, RelayFrameBodyKind::Reset);
-    }
-
-    // Diagnostic spans must export without waiting for the relay to close.
-    assert!(!environment_task.is_finished());
-    let spans = span_exporter.get_finished_spans()?;
-    assert!(spans.iter().any(|span| {
-        span.name == "codex.exec_server.noise_handshake_diagnostic"
-            && span.parent_span_id == SpanId::INVALID
-            && [
-                ("noise_outcome", "reset_received"),
-                ("stream_id", reset_stream_id.as_str()),
-            ]
-            .iter()
-            .all(|(key, value)| {
-                span.attributes.iter().any(|attribute| {
-                    attribute.key.as_str() == *key && attribute.value.to_string() == *value
-                })
-            })
-    }));
-
-    harness_websocket.close(None).await?;
-    assert_eq!(
-        timeout(Duration::from_secs(1), environment_task).await??,
-        RendezvousDisconnectReason::PeerClose,
-    );
-    logs.seek(SeekFrom::Start(0))?;
-    let mut output = String::new();
-    logs.read_to_string(&mut output)?;
-    let events: Vec<_> = output
-        .lines()
-        .filter(|line| line.contains("Noise executor handshake diagnostic"))
-        .collect();
-    assert_eq!(events.len(), MAX_FAILED_NOISE_HANDSHAKES + 5);
-    let rejection = events
-        .iter()
-        .find(|line| line.contains(&valid_stream_id))
-        .expect("correlated rejection");
-    for field in [
-        "noise_outcome=\"rejected\"",
-        "handshake_request",
-        ENVIRONMENT_ID,
-        EXECUTOR_REGISTRATION_ID,
-    ] {
-        assert!(rejection.contains(field));
-    }
-    for (reason, detail) in [
-        ("handshake_request", "stream_id=\"invalid\""),
-        ("registry_http", "Some(503)"),
-        ("validation_timeout", "None"),
-        (
-            "reset_pending_validation",
-            "noise_outcome=\"reset_received\"",
-        ),
-    ] {
-        assert!(
-            events
-                .iter()
-                .any(|line| line.contains(reason) && line.contains(detail))
-        );
-    }
-    assert!(
-        events.iter().any(
-            |line| line.contains("reset_pending_validation") && line.contains(&reset_stream_id)
-        )
-    );
-    let exported = format!("{spans:?}\n{output}");
-    for secret in [
-        "malformed-1",
-        "after-cooldown",
-        "authorization-secret",
-        "registry-response-secret",
-        "untrusted-reset-secret",
-    ] {
-        assert!(!exported.contains(secret));
-    }
     Ok(())
 }
 

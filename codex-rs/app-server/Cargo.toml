@@ -151,8 +151,6 @@ hmac = { workspace = true }
 http = { workspace = true }
 insta = { workspace = true }
 keyring = { workspace = true }
-opentelemetry = { workspace = true }
-opentelemetry_sdk = { workspace = true }
 pretty_assertions = { workspace = true }
 rcgen = { workspace = true }
 rmcp = { workspace = true, default-features = false, features = [
@@ -167,5 +165,4 @@ tar = { workspace = true }
 test-case = "3.3.1"
 tokio-rustls = { workspace = true }
 tokio-tungstenite = { workspace = true }
-tracing-opentelemetry = { workspace = true }
 wiremock = { workspace = true }
