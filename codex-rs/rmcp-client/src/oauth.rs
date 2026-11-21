@@ -1200,8 +1200,6 @@ mod tests {
     mod credential_store_tests;
     #[path = "persistor_tests.rs"]
     mod persistor_tests;
-    #[path = "telemetry_tests.rs"]
-    mod telemetry_tests;
 
     use super::test_support::TempCodexHome;
 

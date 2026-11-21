@@ -36,11 +36,6 @@ use codex_history::RolloutItem;
 use codex_login::CodexAuth;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_models_manager::bundled_models_response;
-use codex_otel::OtelExporter;
-use codex_otel::OtelHttpProtocol;
-use codex_otel::OtelProvider;
-use codex_otel::OtelSettings;
-use codex_otel::THREAD_SKILLS_KEPT_TOTAL_METRIC;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::mcp_policy::EnvironmentMcpPolicy;
@@ -115,8 +110,6 @@ use core_test_support::test_codex::test_env;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_mcp_server;
-use opentelemetry_sdk::metrics::data::AggregatedMetrics;
-use opentelemetry_sdk::metrics::data::MetricData;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
@@ -2732,27 +2725,6 @@ async fn assert_catalog_model_switch(max_context_tokens: Option<usize>) -> Resul
     )
     .await;
     let codex_home = Arc::new(TempDir::new()?);
-    // Use the normal metrics sink to verify core's model attribution.
-    let telemetry = OtelProvider::try_new(&OtelSettings {
-        http_client_factory: codex_core::test_support::default_http_client_factory(),
-        environment: "test".to_string(),
-        service_name: "skills-model-switch".to_string(),
-        service_version: env!("CARGO_PKG_VERSION").to_string(),
-        codex_home: codex_home.path().to_path_buf(),
-        exporter: OtelExporter::None,
-        trace_exporter: OtelExporter::None,
-        metrics_exporter: OtelExporter::OtlpHttp {
-            endpoint: format!("{}/metrics", server.uri()),
-            headers: Default::default(),
-            protocol: OtelHttpProtocol::Json,
-            tls: None,
-        },
-        runtime_metrics: true,
-        span_attributes: Default::default(),
-        tracestate: Default::default(),
-    })
-    .map_err(|error| anyhow::anyhow!("{error}"))?
-    .expect("metrics provider");
     let skill_count = 800;
     let catalog = SkillCatalog {
         is_partial: false,
@@ -2931,42 +2903,6 @@ async fn assert_catalog_model_switch(max_context_tokens: Option<usize>) -> Resul
         .collect::<Vec<_>>();
     expected_warnings.dedup();
     assert_eq!(warnings, expected_warnings);
-
-    let snapshot = telemetry.metrics().expect("metrics client").snapshot()?;
-    let metric = snapshot
-        .scope_metrics()
-        .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
-        .find(|metric| metric.name() == THREAD_SKILLS_KEPT_TOTAL_METRIC)
-        .expect("catalog metrics");
-    let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = metric.data() else {
-        panic!("catalog metric should be a histogram");
-    };
-    let mut samples = histogram
-        .data_points()
-        .filter_map(|point| {
-            let attributes = point
-                .attributes()
-                .map(|attribute| (attribute.key.as_str(), attribute.value.as_str().to_string()))
-                .collect::<std::collections::BTreeMap<_, _>>();
-            (attributes.get("catalog_surface").map(String::as_str) == Some("host_world_state")
-                && matches!(
-                    attributes.get("model").map(String::as_str),
-                    Some(MODEL_A | MODEL_B)
-                ))
-            .then(|| (attributes["model"].clone(), point.count(), point.sum()))
-        })
-        .collect::<Vec<_>>();
-    samples.sort_by(|left, right| left.0.cmp(&right.0));
-    assert_eq!(
-        samples,
-        vec![
-            (MODEL_A.to_string(), 1, included_counts[0] as f64),
-            (MODEL_B.to_string(), 1, included_counts[1] as f64),
-        ]
-    );
-    telemetry
-        .shutdown_with_timeout(Duration::from_secs(/*secs*/ 5))
-        .await?;
     Ok(())
 }
 

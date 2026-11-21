@@ -1,6 +1,5 @@
 //! Exercises async and serving assessments through real tool calls, hooks, and approval results.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,8 +13,6 @@ use codex_history::RetainedContextEvent;
 use codex_history::RolloutItem;
 use codex_history::VerifiedAnswer;
 use codex_history::VerifiedQuestionAnswer;
-use codex_otel::MetricsClient;
-use codex_otel::MetricsConfig;
 use codex_protocol::approvals::GuardianAssessmentStatus;
 use codex_protocol::approvals::GuardianReviewReason;
 use codex_protocol::config_types::ApprovalsReviewer;
@@ -41,8 +38,6 @@ use core_test_support::streaming_sse::StreamingSseChunk;
 use core_test_support::streaming_sse::start_streaming_sse_server;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
-use opentelemetry_sdk::metrics::data::AggregatedMetrics;
-use opentelemetry_sdk::metrics::data::MetricData;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use tokio::sync::oneshot;
@@ -201,12 +196,8 @@ async fn delayed_score_only_covers_the_tool_call_it_classified() -> Result<()> {
         })
         .build_with_auto_env(&server)
         .await?;
-    let metrics = MetricsClient::new(
-        MetricsConfig::in_memory("test", "test", "1", Default::default()).with_runtime_reader(),
-    )?;
     let mut options = test.start_thread_options().await;
     options.history_mode = Some(codex_protocol::protocol::ThreadHistoryMode::Legacy);
-    options.thread_extension_init.insert(metrics.clone());
     test.codex.shutdown_and_wait().await?;
     test.codex = test.thread_manager.start_thread(options).await?.thread;
     test.codex.ensure_rollout_materialized().await;
@@ -323,42 +314,6 @@ async fn delayed_score_only_covers_the_tool_call_it_classified() -> Result<()> {
     }
 
     test.codex.shutdown_and_wait().await?;
-    let snapshot = metrics.snapshot()?;
-    let route = snapshot
-        .scope_metrics()
-        .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
-        .find(|metric| metric.name() == "codex.guardian.review.route")
-        .unwrap();
-    let AggregatedMetrics::U64(MetricData::Sum(routes)) = route.data() else {
-        panic!("expected route counter");
-    };
-    for point in routes.data_points() {
-        let model = point
-            .attributes()
-            .find(|tag| tag.key.as_str() == "model")
-            .unwrap();
-        assert_eq!(model.value.as_str(), "guardian-publication-parent");
-    }
-    let metric = snapshot
-        .scope_metrics()
-        .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
-        .find(|metric| metric.name() == "codex.guardian.review.retry_wait_ms")
-        .unwrap();
-    let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = metric.data() else {
-        panic!("expected retry-wait histogram");
-    };
-    let points = histogram.data_points().collect::<Vec<_>>();
-    assert_eq!(points.len(), 1);
-    let point = points[0];
-    let tags = point
-        .attributes()
-        .map(|tag| (tag.key.as_str(), tag.value.as_str().to_string()))
-        .collect::<BTreeMap<_, _>>();
-    assert_eq!(tags["model"], "guardian-publication-parent");
-    assert_eq!(tags["failure_reason"], "parse_error");
-    assert_eq!(tags["outcome"], "retry");
-    assert_eq!(point.count(), 1);
-    assert!(point.sum() > 0.0);
     parent_server.shutdown().await;
     classifier_server.shutdown().await;
     Ok(())

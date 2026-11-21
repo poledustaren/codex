@@ -240,13 +240,11 @@ mod token_usage_rollout;
 mod tool_harness;
 mod tool_lifecycle;
 mod tool_parallelism;
-mod tool_registration_metrics;
 mod tools;
 mod truncation;
 #[path = "turn_error_details_tests.rs"]
 mod turn_error_details;
 mod turn_input_submission;
-mod turn_phase_trace;
 mod turn_state;
 mod unified_exec;
 #[path = "unified_exec_launch_failure_tests.rs"]

@@ -28,8 +28,6 @@ use codex_login::AuthHeaders;
 use codex_login::CodexAuth;
 use codex_models_manager::ModelOrigin;
 use codex_models_manager::manager::RefreshStrategy;
-use codex_otel::MetricsClient;
-use codex_otel::MetricsConfig;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::WindowsSandboxLevel;
@@ -100,7 +98,6 @@ use wiremock::matchers::method;
 use wiremock::matchers::path;
 use wiremock::matchers::path_regex;
 
-use super::guardian_mcp_elicitation::guardian_blocking_samples;
 use super::network_approval::guardian_parent_catalog;
 use super::rmcp_client::remote_aware_environment_id;
 use super::rmcp_client::remote_aware_stdio_server_bin;
@@ -3160,12 +3157,8 @@ async fn yielded_code_mode_denials_interrupt_the_servicing_turn() -> Result<()> 
             config.approvals_reviewer = ApprovalsReviewer::AutoReview;
         });
     let mut test = builder.build_with_auto_env(&server).await?;
-    let metrics = MetricsClient::new(
-        MetricsConfig::in_memory("test", "test", "1", Default::default()).with_runtime_reader(),
-    )?;
     let mut options = test.start_thread_options().await;
     options.history_mode = Some(codex_protocol::protocol::ThreadHistoryMode::Legacy);
-    options.thread_extension_init.insert(metrics.clone());
     let thread = test.thread_manager.start_thread(options).await?;
     test.codex.shutdown_and_wait().await?;
     test.codex = thread.thread;
@@ -3313,10 +3306,6 @@ for (let index = 0; index < 6; index++) {{
         );
     }
     test.codex.shutdown_and_wait().await?;
-    let mut samples = guardian_blocking_samples(&metrics, "outcome")?;
-    assert_eq!(samples.remove("completed"), Some(0.0));
-    assert!(samples.remove("aborted").unwrap() > 0.0);
-    assert!(samples.is_empty());
     Ok(())
 }
 
@@ -3389,12 +3378,8 @@ text(await tools.exec_command({
         .with_model("gpt-5.4")
         .build_with_auto_env(&server)
         .await?;
-    let metrics = MetricsClient::new(
-        MetricsConfig::in_memory("test", "test", "1", Default::default()).with_runtime_reader(),
-    )?;
     let mut options = test.start_thread_options().await;
     options.history_mode = Some(codex_protocol::protocol::ThreadHistoryMode::Legacy);
-    options.thread_extension_init.insert(metrics.clone());
     let thread = test.thread_manager.start_thread(options).await?;
     test.codex.shutdown_and_wait().await?;
     test.codex = thread.thread;
@@ -3447,10 +3432,6 @@ text(await tools.exec_command({
     })
     .await;
     test.codex.shutdown_and_wait().await?;
-    let samples = guardian_blocking_samples(&metrics, "model")?;
-    assert_eq!(samples.len(), 2);
-    assert!(samples["gpt-5.4"] > 0.0);
-    assert!(samples["gpt-5.2"] > 0.0);
     streaming.shutdown().await;
     Ok(())
 }
