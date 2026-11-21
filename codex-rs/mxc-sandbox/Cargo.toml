@@ -21,12 +21,14 @@ codex-protocol = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
 codex-utils-path-uri = { workspace = true }
 codex-windows-sandbox = { workspace = true }
-mxc-sdk = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 
+# AVL: mxc-sdk нужен только на Windows (модули native и policy собираются под cfg(windows));
+# на остальных платформах, включая Android, он не компилируется.
 [target.'cfg(windows)'.dependencies]
+mxc-sdk = { workspace = true }
 flatbuffers = { workspace = true }
 # 1.2.4 imports OneCore_apiset, which the GNU Windows toolchain does not ship.
 tracelogging = "=1.2.3"
@@ -40,5 +42,7 @@ windows-sys = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
+# тесты policy идут на любой платформе
+mxc-sdk = { workspace = true }
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }

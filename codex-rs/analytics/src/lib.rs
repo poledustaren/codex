@@ -1,3 +1,7 @@
+// AVL: доставка аналитики отключена (см. AnalyticsEventsClient::new_with_runtime), очередь и события
+// оставлены как есть ради простого слияния с upstream — отсюда недостижимый код.
+#![allow(dead_code)]
+
 mod accepted_lines;
 #[cfg(debug_assertions)]
 mod analytics_capture;

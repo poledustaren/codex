@@ -398,12 +398,10 @@ impl AnalyticsEventsClient {
                     != codex_http_client::OpenAiDestination::Other
             }
         });
-        let destination = AnalyticsEventsDestination::from_base_url(base_url, api_key_headers);
-        Self {
-            queue: (analytics_enabled != Some(false)).then(|| {
-                AnalyticsEventsQueue::new(Arc::clone(&auth_manager), destination, runtime_auth)
-            }),
-        }
+        // AVL: аналитика в этой сборке не отправляется никогда, какой бы ни была настройка
+        // `analytics.enabled`: очередь доставки не создаётся, все track_* становятся пустыми.
+        let _ = (auth_manager, base_url, analytics_enabled, runtime_auth, api_key_headers);
+        Self { queue: None }
     }
 
     /// Give a resumed actor its own queue while preserving the caller's analytics setting.

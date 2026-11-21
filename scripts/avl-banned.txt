@@ -1,0 +1,12 @@
+# Крейты, которых не должно быть в дереве зависимостей AVL (регулярные выражения на имя целиком).
+# Проверяет scripts/avl-check.sh; строка появляется вместе с вырезанием подсистемы.
+opentelemetry.*            # OpenTelemetry: codex-otel — заглушка
+tracing-opentelemetry
+sentry.*                   # отчёты обратной связи в Sentry OpenAI
+codex-aws-auth             # Amazon Bedrock
+aws-config
+aws-runtime
+aws-sdk-.*
+aws-types
+symphonia.*                # декодер аудио
+codex-external-agent-migration
