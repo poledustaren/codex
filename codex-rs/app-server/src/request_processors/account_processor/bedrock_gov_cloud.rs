@@ -9,7 +9,6 @@ use codex_app_server_protocol::ClientResponsePayload;
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_config::NetworkDomainPermissionToml;
 use codex_model_provider::is_amazon_bedrock_gov_cloud_region;
-use codex_model_provider::resolve_amazon_bedrock_region;
 use codex_protocol::config_types::ForcedLoginMethod;
 
 impl AccountRequestProcessor {
@@ -55,15 +54,14 @@ impl AccountRequestProcessor {
             // Require a single region label, not a substring in a proxy hostname.
             (!region.is_empty() && !region.contains('.')).then_some(region)
         });
-        let region = match endpoint_region {
-            Some(region) => region.to_string(),
-            None => {
-                resolve_amazon_bedrock_region(provider.clone(), Some(self.auth_manager.clone()))
-                    .await
-                    .map_err(|err| {
-                        internal_error(format!("failed to resolve Amazon Bedrock region: {err}"))
-                    })?
-            }
+        let Some(region) = endpoint_region.map(str::to_string) else {
+            return Ok(Some(
+                BedrockCheckGovCloudRequirementsResponse {
+                    is_gov_cloud: false,
+                    should_warn: false,
+                }
+                .into(),
+            ));
         };
         let is_gov_cloud = is_amazon_bedrock_gov_cloud_region(&region);
         let mut should_warn = false;

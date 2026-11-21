@@ -823,11 +823,5 @@ fn upload_tags_include_client_tags_and_preserve_reserved_fields() {
     );
 }
 
-#[path = "feedback_event_tests.rs"]
-mod feedback_event_tests;
-#[path = "metadata_tests.rs"]
-mod metadata_tests;
-#[path = "rollout_attachment_tests.rs"]
-mod rollout_attachment_tests;
 #[path = "save_rollout_tests.rs"]
 mod save_rollout_tests;

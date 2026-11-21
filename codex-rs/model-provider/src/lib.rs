@@ -1,4 +1,4 @@
-mod amazon_bedrock;
+mod bedrock_region;
 mod auth;
 mod bearer_auth_provider;
 mod capabilities;
@@ -23,9 +23,6 @@ pub use workspace_routing::ResolvedResponsesProvider;
 pub use workspace_routing::ResponsesConnectionKey;
 pub use workspace_routing::WorkspaceRoutingContext;
 
-pub use amazon_bedrock::is_amazon_bedrock_gov_cloud_region;
-pub use amazon_bedrock::is_supported_amazon_bedrock_region;
-pub use amazon_bedrock::resolve_amazon_bedrock_region;
 pub use auth::AgentIdentitySessionFallback;
 pub use auth::ProviderAuthContext;
 pub use auth::ProviderAuthScope;
@@ -34,6 +31,8 @@ pub use auth::auth_provider_for_request;
 pub use auth::auth_provider_from_auth;
 pub use auth::auth_provider_from_auth_manager;
 pub use auth::unauthenticated_auth_provider;
+pub use bedrock_region::is_amazon_bedrock_gov_cloud_region;
+pub use bedrock_region::is_supported_amazon_bedrock_region;
 pub use bearer_auth_provider::BearerAuthProvider;
 pub use bearer_auth_provider::BearerAuthProvider as CoreAuthProvider;
 pub use capabilities::ProviderCapabilities;

@@ -29,7 +29,6 @@ use codex_runtime_agent_instance::RuntimeAuthManager;
 
 use crate::ProviderCapabilities;
 use crate::ResolvedResponsesProvider;
-use crate::amazon_bedrock::AmazonBedrockModelProvider;
 use crate::auth::ProviderAuthScope;
 use crate::auth::ResolvedProviderAuth;
 use crate::auth::auth_manager_for_provider;
@@ -453,9 +452,6 @@ pub(crate) fn create_model_provider_with_runtime(
     auth_manager: Option<Arc<AuthManager>>,
     runtime_auth: Option<(Arc<RuntimeAuthManager>, RuntimeAuthMode)>,
 ) -> SharedModelProvider {
-    if provider_info.is_amazon_bedrock() {
-        return Arc::new(AmazonBedrockModelProvider::new(provider_info, auth_manager));
-    }
     if provider_info.is_gcp() {
         return Arc::new(GcpModelProvider::new(provider_info, auth_manager));
     }
@@ -520,6 +516,11 @@ impl ConfiguredModelProvider {
         &self,
         scope: Option<ProviderAuthScope>,
     ) -> codex_protocol::error::Result<ResolvedProviderAuth> {
+        if self.info.is_amazon_bedrock() {
+            return Err(codex_protocol::error::CodexErr::Fatal(
+                "Amazon Bedrock не поддерживается в этой сборке".to_string(),
+            ));
+        }
         let resolved = resolve_request_auth(
             self.info.clone(),
             self.auth_manager.clone(),

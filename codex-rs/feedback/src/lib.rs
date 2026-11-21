@@ -9,15 +9,10 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::Duration;
-use std::time::Instant;
 
-use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
-use codex_http_client::ClientRouteClass;
 use codex_http_client::HttpClientFactory;
-use codex_http_client::RouteAwareClientPool;
 use codex_login::AuthEnvTelemetry;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::SessionSource;
@@ -36,9 +31,6 @@ mod daemon_logs;
 pub use daemon_logs::daemon_log_attachments;
 pub(crate) mod feedback_diagnostics;
 mod guardian;
-mod report_upload;
-mod rollout_archive;
-mod upload;
 pub use feedback_diagnostics::FEEDBACK_DIAGNOSTICS_ATTACHMENT_FILENAME;
 pub use feedback_diagnostics::FeedbackDiagnostic;
 pub use feedback_diagnostics::FeedbackDiagnostics;
@@ -46,9 +38,6 @@ pub use guardian::GuardianReviewFailures;
 pub use guardian::GuardianReviewRecord;
 pub use guardian::guardian_review_failures;
 pub use guardian::record_guardian_review_failure;
-pub use report_upload::FeedbackDelivery;
-pub use report_upload::FeedbackTransport;
-pub use report_upload::prepare_report_attachment;
 
 /// Filename used for the redacted `codex doctor --json` feedback attachment.
 pub const DOCTOR_REPORT_ATTACHMENT_FILENAME: &str = "codex-doctor-report.json";
@@ -59,17 +48,12 @@ pub const CODEX_APP_DIRECTORY_CACHE_ATTACHMENT_FILENAME: &str = "codex-app-direc
 /// Filename used for the Windows sandbox log feedback attachment.
 pub const WINDOWS_SANDBOX_LOG_ATTACHMENT_FILENAME: &str = "windows-sandbox.log";
 const DEFAULT_MAX_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
-const SENTRY_DSN: &str =
-    "https://ae32ed50620d7a7792c1ce5df38b3e3e@o33249.ingest.us.sentry.io/4510195390611458";
-const UPLOAD_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 300);
 // Raw collection budgets used by the report API, not the interactive upload.
 pub const MAX_ATTACHMENT_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_ATTACHMENTS_BYTES: usize = 126 * 1024 * 1024;
 // Bound decoded envelopes, including framing. Do not shorten attachments to fit:
 // they may already be compressed, and callers need an error for incomplete delivery.
 // This bounds the decoded request including framing, not guaranteed attachment storage.
-// https://develop.sentry.dev/sdk/foundations/envelopes/#size-limits
-const MAX_DECODED_UPLOAD_BYTES: usize = 200 * 1024 * 1024;
 const MAX_EVENT_BYTES: usize = 1024 * 1024;
 const FEEDBACK_TAGS_TARGET: &str = "feedback_tags";
 // Leave room for every feature, usage settings, and request/auth diagnostics.
@@ -562,15 +546,10 @@ impl FeedbackSnapshot {
         reason: Option<&str>,
         tags: Option<&BTreeMap<String, String>>,
         session_source: Option<&SessionSource>,
-    ) -> sentry::protocol::Event<'static> {
-        use sentry::protocol::Event;
-        use sentry::protocol::Exception;
-        use sentry::protocol::Level;
-        use sentry::protocol::Values;
-
+    ) -> serde_json::Value {
         let level = match classification {
-            "bug" | "bad_result" | "safety_check" => Level::Error,
-            _ => Level::Info,
+            "bug" | "bad_result" | "safety_check" => "error",
+            _ => "info",
         };
         let custom_title = tags
             .and_then(|tags| tags.get("feedback_title"))
@@ -586,22 +565,15 @@ impl FeedbackSnapshot {
             },
             str::to_owned,
         );
-        let mut event = Event {
-            level,
-            message: Some(title.clone()),
-            tags: self.upload_tags(classification, reason, tags, session_source),
-            ..Default::default()
-        };
-        if custom_title.is_some() {
-            // A shared title must not merge independent reports and suppress new-issue alerts.
-            event.fingerprint = vec![event.event_id.to_string().into()].into();
-        }
+        let mut event = serde_json::json!({
+            "level": level,
+            "message": title,
+            "tags": self.upload_tags(classification, reason, tags, session_source),
+        });
         if let Some(reason) = reason {
-            event.exception = Values::from(vec![Exception {
-                ty: title,
-                value: Some(reason.to_string()),
-                ..Default::default()
-            }]);
+            event["exception"] = serde_json::json!({
+                "values": [{ "type": title, "value": reason }],
+            });
         }
         event
     }
@@ -631,22 +603,14 @@ impl FeedbackSnapshot {
         self.feedback_diagnostics.attachment_text()
     }
 
-    /// Submit feedback to Sentry with whole attachments within a shared deadline.
-    /// Success means HTTP acceptance, not durable attachment storage. Callers must
-    /// retain their source files; errors can occur after part of a report is accepted.
-    /// https://github.com/getsentry/relay/blob/master/relay-server/src/endpoints/common.rs
+    /// Uploading feedback is unavailable in this build; always returns an error without
+    /// touching the network.
     pub async fn upload_feedback(
         &self,
-        options: FeedbackUploadOptions<'_>,
-        http_client_factory: &HttpClientFactory,
+        _options: FeedbackUploadOptions<'_>,
+        _http_client_factory: &HttpClientFactory,
     ) -> Result<()> {
-        self.upload_feedback_with_dsn(
-            options,
-            http_client_factory,
-            SENTRY_DSN,
-            Instant::now() + UPLOAD_TIMEOUT,
-        )
-        .await
+        Err(anyhow!("отправка отчётов отключена в этой сборке"))
     }
 
     /// Atomically saves the consent-selected report and attachments without uploading.
@@ -687,143 +651,6 @@ impl FeedbackSnapshot {
                 ),
             archive::Limits::default(),
         )
-    }
-
-    async fn upload_feedback_with_dsn(
-        &self,
-        options: FeedbackUploadOptions<'_>,
-        http_client_factory: &HttpClientFactory,
-        dsn: &str,
-        deadline: Instant,
-    ) -> Result<()> {
-        use std::str::FromStr;
-
-        use sentry::protocol::Envelope;
-        use sentry::protocol::EnvelopeItem;
-        use sentry::types::Dsn;
-
-        let started_at = Instant::now();
-        let dsn = Dsn::from_str(dsn).map_err(|error| anyhow!("invalid DSN: {error}"))?;
-
-        let event = self.feedback_event(
-            options.classification,
-            options.reason,
-            options.tags,
-            options.session_source.as_ref(),
-        );
-        let mut envelope = Envelope::new();
-        envelope.add_item(EnvelopeItem::Event(event));
-        let (event_body, event_bytes) =
-            upload::encode_envelope(&envelope).context("failed to serialize feedback event")?;
-        anyhow::ensure!(
-            event_bytes <= MAX_EVENT_BYTES,
-            "feedback event exceeds the size limit"
-        );
-        let headers = envelope.headers().clone();
-        drop(envelope);
-        let client_pool = RouteAwareClientPool::new_without_redirects_or_request_logging(
-            http_client_factory.clone(),
-            ClientRouteClass::Other,
-        );
-        // Accept the report before reading diagnostics; all envelopes share one deadline.
-        let mut rate_limited = false;
-        let status = upload::send_envelope(
-            &client_pool,
-            &dsn,
-            event_body,
-            upload::EnvelopeKind::Event,
-            deadline,
-            &mut rate_limited,
-        )
-        .await?;
-        anyhow::ensure!(
-            status.is_success(),
-            "Sentry rejected feedback upload with HTTP status {status}"
-        );
-
-        let mut attachments = self.feedback_attachments(
-            &headers,
-            options.include_logs,
-            options.extra_attachments,
-            options.extra_attachment_paths,
-            options.logs_override,
-        );
-        let mut uploaded_attachments = 0;
-        let mut attachments_failed = false;
-        // Keep attachments linked to the accepted event, without replaying its contents.
-        // Inspect the upper bound without reading the next file after the deadline.
-        while attachments.size_hint().1 != Some(0) {
-            if rate_limited || Instant::now() >= deadline {
-                attachments_failed = true;
-                tracing::error!(
-                    reason = if rate_limited {
-                        "rate limit"
-                    } else {
-                        "upload deadline"
-                    },
-                    "remaining feedback attachments skipped"
-                );
-                break;
-            }
-            let Some(attachment) = attachments.next() else {
-                break;
-            };
-            if Instant::now() >= deadline {
-                attachments_failed = true;
-                tracing::error!(
-                    "remaining feedback attachments skipped: upload deadline reached while reading attachment"
-                );
-                break;
-            }
-            let mut status = None;
-            let result: Result<()> = async {
-                let body = upload::encode_attachment_envelope(&headers, attachment?)?;
-                let response_status = upload::send_envelope(
-                    &client_pool,
-                    &dsn,
-                    body,
-                    upload::EnvelopeKind::Attachment,
-                    deadline,
-                    &mut rate_limited,
-                )
-                .await
-                .map_err(|error| {
-                    // Transport error strings can contain credential-bearing URLs.
-                    if let Some(cause) = error.downcast_ref::<codex_http_client::RouteAwareRequestError>() {
-                        anyhow!(
-                            "feedback transport failed: class={:?}, timeout={}, connect={}, request={}, body={}",
-                            cause.failure_class(), cause.is_timeout(), cause.is_connect(), cause.is_request(), cause.is_body()
-                        )
-                    } else {
-                        error
-                    }
-                })?;
-
-                status = Some(response_status.as_u16());
-                anyhow::ensure!(response_status.is_success(), "Sentry rejected attachment");
-                Ok(())
-            }
-            .await;
-            if let Err(error) = result {
-                attachments_failed = true;
-                // Keep trying other diagnostics before reporting the partial failure.
-                tracing::error!(status, error = %format!("{error:#}"), "feedback attachment upload failed; continuing");
-            } else {
-                uploaded_attachments += 1;
-            }
-        }
-        tracing::info!(
-            thread_id = %self.thread_id,
-            uploaded_attachments,
-            attachments_failed,
-            elapsed_ms = started_at.elapsed().as_millis(),
-            "feedback event uploaded to Sentry"
-        );
-        anyhow::ensure!(
-            !attachments_failed,
-            "feedback report was accepted, but some attachments failed to upload"
-        );
-        Ok(())
     }
 
     fn upload_tags(
@@ -880,105 +707,6 @@ impl FeedbackSnapshot {
         }
 
         tags
-    }
-
-    fn feedback_attachments<'a>(
-        &'a self,
-        headers: &'a sentry::protocol::EnvelopeHeaders,
-        include_logs: bool,
-        extra_attachments: Vec<FeedbackAttachment>,
-        extra_attachment_paths: &'a [FeedbackAttachmentPath],
-        logs_override: Option<Vec<u8>>,
-    ) -> impl Iterator<Item = Result<sentry::protocol::Attachment>> + 'a {
-        use sentry::protocol::Attachment;
-
-        // Partition metadata without reading files before the event is accepted. Keep
-        // generated diagnostics first, then rollouts, then remaining files in caller order.
-        let (rollouts, diagnostics_attachments): (Vec<_>, Vec<_>) =
-            extra_attachments.into_iter().partition(|attachment| {
-                codex_rollout::rollout_id_from_path(Path::new(&attachment.filename)).is_some()
-            });
-        let (rollout_paths, diagnostic_paths): (Vec<_>, Vec<_>) =
-            extra_attachment_paths.iter().partition(|attachment| {
-                codex_rollout::rollout_id_from_path(&attachment.path).is_some()
-            });
-        let has_rollouts = !rollouts.is_empty() || !rollout_paths.is_empty();
-        let archive = has_rollouts
-            .then_some((rollout_paths, rollouts))
-            .into_iter()
-            .flat_map(move |(paths, rollouts)| {
-                let archive =
-                    tempfile::tempdir()
-                        .map_err(anyhow::Error::from)
-                        .and_then(|directory| {
-                            let output_path = directory.path().join("rollouts.tar.gz");
-                            let Some(archive) = rollout_archive::archive_rollouts(
-                                &output_path,
-                                paths.iter().copied(),
-                                &rollouts,
-                                MAX_DECODED_UPLOAD_BYTES,
-                            )?
-                            else {
-                                return Ok(None);
-                            };
-                            let attachment = archive
-                                .read_attachment(MAX_DECODED_UPLOAD_BYTES)?
-                                .context("rollout archive is missing or exceeds the size limit")?;
-                            // Measure framing without copying the archive. Account for the extra
-                            // decimal digits when the empty attachment's length becomes nonzero.
-                            let mut envelope =
-                                sentry::protocol::Envelope::new().with_headers(headers.clone());
-                            envelope.add_item(Attachment {
-                                filename: attachment.filename.clone(),
-                                content_type: attachment.content_type.clone(),
-                                ..Default::default()
-                            });
-                            let mut framing = Vec::new();
-                            envelope.to_writer(&mut framing)?;
-                            let archive_bytes = attachment.buffer.len();
-                            let envelope_bytes = framing.len()
-                                + archive_bytes
-                                + archive_bytes.checked_ilog10().unwrap_or(0) as usize;
-                            anyhow::ensure!(
-                                envelope_bytes <= MAX_DECODED_UPLOAD_BYTES,
-                                "rollout archive envelope exceeds the size limit"
-                            );
-                            Ok(Some(attachment))
-                        });
-                rollout_archive::with_individual_fallback(
-                    archive,
-                    paths,
-                    rollouts,
-                    MAX_DECODED_UPLOAD_BYTES,
-                )
-            });
-        let logs = include_logs.then(|| self.log_attachment(logs_override));
-        let diagnostics = self
-            .feedback_diagnostics_attachment_text(include_logs)
-            .map(|text| FeedbackAttachment {
-                buffer: text.into_bytes(),
-                filename: FEEDBACK_DIAGNOSTICS_ATTACHMENT_FILENAME.to_string(),
-                content_type: Some("text/plain".to_string()),
-            });
-
-        logs.into_iter()
-            .chain(diagnostics_attachments)
-            .chain(diagnostics)
-            .map(Ok)
-            .chain(archive)
-            .chain(diagnostic_paths.into_iter().map(|attachment_path| {
-                attachment_path
-                    .read_attachment(MAX_DECODED_UPLOAD_BYTES)?
-                    .context("feedback attachment is not a regular file or exceeds the size limit")
-            }))
-            .map(|attachment| {
-                attachment.map(|attachment| Attachment {
-                    buffer: attachment.buffer,
-                    filename: attachment.filename,
-                    content_type: attachment.content_type,
-                    ty: None,
-                })
-            })
     }
 }
 
