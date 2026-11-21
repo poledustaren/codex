@@ -12,7 +12,6 @@ base64 = { workspace = true }
 codex-protocol = { workspace = true }
 codex-utils-cache = { workspace = true }
 codex-utils-string = { workspace = true }
-symphonia = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 

@@ -1,4 +1,4 @@
-//! Audio preparation and duration-based token estimates for model inputs.
+//! Audio preparation and token estimates for model inputs.
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -10,16 +10,10 @@ use codex_protocol::models::ResponseItem;
 use codex_utils_cache::BlockingLruCache;
 use codex_utils_cache::sha1_digest;
 use codex_utils_string::approx_token_count;
-use std::io::Cursor;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::OnceLock;
-use symphonia::core::formats::FormatOptions;
-use symphonia::core::formats::TrackType;
-use symphonia::core::formats::probe::Hint;
-use symphonia::core::io::MediaSourceStream;
-use symphonia::core::meta::MetadataOptions;
 use tracing::warn;
 
 const AUDIO_PROCESSING_ERROR_PLACEHOLDER: &str =
@@ -182,69 +176,21 @@ fn estimate_tool_audio_tokens_with(
     }
 }
 
-/// Estimates audio tokens from decoded duration, falling back to the data URL size.
+/// Estimates audio tokens from the data URL size, caching the result per URL.
 fn estimate_audio_token_count(audio_url: &str) -> usize {
     let key = sha1_digest(audio_url.as_bytes());
     AUDIO_TOKEN_ESTIMATE_CACHE
         .get_or_init(key, || estimate_audio_token_count_without_cache(audio_url))
 }
 
-/// The same duration-based estimate without accessing the Tokio-dependent cache.
+/// The same size-based estimate without accessing the Tokio-dependent cache.
 /// Suitable for bounded output rendered on a current-thread runtime.
+///
+/// This fork has no audio decoder, so duration is unknown. The size of the data URL
+/// (base64 text, larger than the raw bytes) is an upper bound on the real cost, which
+/// keeps the budget conservative.
 fn estimate_audio_token_count_without_cache(audio_url: &str) -> usize {
-    let Some(duration_seconds) = audio_duration_seconds(audio_url) else {
-        return approx_token_count(audio_url);
-    };
-    let token_count = (duration_seconds * f64::from(AUDIO_TOKENS_PER_SECOND)).ceil();
-    if token_count >= usize::MAX as f64 {
-        usize::MAX
-    } else {
-        token_count as usize
-    }
-}
-
-fn audio_duration_seconds(audio_url: &str) -> Option<f64> {
-    let (metadata, payload) = audio_url.split_once(',')?;
-    let metadata = metadata.get("data:".len()..)?;
-    let mut metadata_parts = metadata.split(';');
-    let canonical_mime = canonical_audio_mime(metadata_parts.next()?)?;
-    if !metadata_parts.any(|part| part.eq_ignore_ascii_case("base64")) {
-        return None;
-    }
-
-    let bytes = match BASE64_STANDARD.decode(payload) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            tracing::trace!(%error, "failed to decode audio payload for token estimation");
-            return None;
-        }
-    };
-    let media_source = MediaSourceStream::new(Box::new(Cursor::new(bytes)), Default::default());
-    let mut hint = Hint::new();
-    hint.mime_type(canonical_mime);
-    let format = match symphonia::default::get_probe().probe(
-        &hint,
-        media_source,
-        FormatOptions::default(),
-        MetadataOptions::default(),
-    ) {
-        Ok(format) => format,
-        Err(error) => {
-            tracing::trace!(%error, "failed to read audio duration for token estimation");
-            return None;
-        }
-    };
-    let track = format.default_track(TrackType::Audio)?;
-    let timing = track.time_base.zip(track.duration).or_else(|| {
-        format
-            .media_info()
-            .time_base
-            .zip(format.media_info().duration)
-    });
-    let (time_base, duration) = timing?;
-    let duration_seconds =
-        duration.get() as f64 * f64::from(time_base.numer.get()) / f64::from(time_base.denom.get());
-    duration_seconds.is_finite().then_some(duration_seconds)
+    approx_token_count(audio_url)
 }
 
 fn prepare_audio(audio_url: &mut String) -> Result<(), AudioPreparationError> {
