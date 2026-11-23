@@ -1700,12 +1700,15 @@ impl Session {
                     Arc::clone(&item_id_generator),
                 ),
             );
+            let override_dynamic_tools = thread_extension_data
+                .remove::<crate::thread_manager::OverrideDynamicTools>()
+                .is_some();
             if matches!(initial_history, InitialHistory::Resumed(_)) {
                 state.persisted_dynamic_tools = initial_history
                     .get_dynamic_tools()
                     .unwrap_or_default()
                     .into();
-                if state.session_configuration.dynamic_tools.is_empty() {
+                if !override_dynamic_tools && state.session_configuration.dynamic_tools.is_empty() {
                     state.session_configuration.dynamic_tools =
                         Arc::clone(&state.persisted_dynamic_tools);
                 }

@@ -5606,3 +5606,30 @@ fn feedback_paths_preserve_native_wire_spelling_before_host_validation() {
         );
     }
 }
+
+#[test]
+fn thread_resume_params_deserializes_dynamic_tools() {
+    let omitted: ThreadResumeParams = serde_json::from_value(json!({
+        "threadId": "thr_1"
+    }))
+    .expect("deserialize without dynamicTools");
+    assert!(omitted.dynamic_tools.is_none());
+
+    let empty: ThreadResumeParams = serde_json::from_value(json!({
+        "threadId": "thr_1",
+        "dynamicTools": []
+    }))
+    .expect("deserialize empty dynamicTools");
+    assert_eq!(empty.dynamic_tools, Some(Vec::new()));
+
+    let with_tool: ThreadResumeParams = serde_json::from_value(json!({
+        "threadId": "thr_1",
+        "dynamicTools": [{
+            "name": "avl_echo",
+            "description": "echo tool",
+            "inputSchema": {"type": "object", "properties": {}}
+        }]
+    }))
+    .expect("deserialize populated dynamicTools");
+    assert_eq!(with_tool.dynamic_tools.as_ref().map(Vec::len), Some(1));
+}

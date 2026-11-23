@@ -4044,9 +4044,15 @@ impl ThreadRequestProcessor {
             base_instructions,
             developer_instructions,
             personality,
+            dynamic_tools,
             exclude_turns,
             initial_turns_page,
         } = params.clone();
+        if let Some(tools) = &dynamic_tools
+            && !tools.is_empty()
+        {
+            validate_dynamic_tools(tools).map_err(invalid_request)?;
+        }
         let include_turns = !exclude_turns;
 
         let prepared_model_context = prepared_config
@@ -4381,6 +4387,8 @@ impl ThreadRequestProcessor {
                     }
                     ThreadResumeTarget::DaemonRecovery(_) => None,
                 },
+                override_dynamic_tools: dynamic_tools.is_some(),
+                dynamic_tools: dynamic_tools.unwrap_or_default(),
                 client_mcp_extensions,
                 ..StartThreadOptions::new(config)
             })

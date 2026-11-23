@@ -429,6 +429,16 @@ pub struct ThreadResumeParams {
     /// Changing this does not rewrite the thread's existing instructions.
     #[ts(optional = nullable)]
     pub personality: Option<Personality>,
+    /// Override dynamic tools registered for the resumed thread.
+    /// When omitted (`None`), persisted dynamic tools from the rollout are restored.
+    /// When provided (`Some(vec)`), the resumed thread uses exactly `vec` (including empty).
+    #[experimental("thread/resume.dynamicTools")]
+    #[serde(
+        default,
+        deserialize_with = "codex_protocol::dynamic_tools::deserialize_dynamic_tool_specs"
+    )]
+    #[ts(optional = nullable)]
+    pub dynamic_tools: Option<Vec<DynamicToolSpec>>,
     /// When true, return only thread metadata and live-resume state without
     /// populating `thread.turns`. This is useful when the client plans to call
     /// `thread/turns/list` immediately after resuming. Full-history hydration

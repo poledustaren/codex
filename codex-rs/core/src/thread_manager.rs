@@ -369,6 +369,8 @@ pub struct StartThreadOptions {
     /// Creation metadata forwarded to storage; never inherited from a fork source.
     pub attached_thread: bool,
     pub dynamic_tools: Vec<codex_protocol::dynamic_tools::DynamicToolSpec>,
+    /// When true, `dynamic_tools` explicitly replaces persisted dynamic tools on resume (even if empty).
+    pub override_dynamic_tools: bool,
     pub metrics_service_name: Option<String>,
     pub parent_trace: Option<W3cTraceContext>,
     pub environments: Option<Vec<TurnEnvironmentRequest>>,
@@ -385,6 +387,10 @@ pub struct StartThreadOptions {
     /// Initial thread-owned plugin selection; omission restores persisted settings.
     pub disabled_plugin_ids: Option<Vec<String>>,
 }
+
+/// Marker inserted into `thread_extension_init` when a resumed thread explicitly
+/// replaces its persisted dynamic tools (including with an empty list).
+pub(crate) struct OverrideDynamicTools;
 
 /// A private, non-sharing provider also detaches a resumed root from its previous live provider.
 struct InheritedThreadInstructions(Instructions);
@@ -450,6 +456,7 @@ impl StartThreadOptions {
             thread_source: None,
             attached_thread: false,
             dynamic_tools: Vec::new(),
+            override_dynamic_tools: false,
             metrics_service_name: None,
             parent_trace: None,
             environments: None,
@@ -2518,6 +2525,7 @@ impl ThreadManagerState {
             thread_source,
             attached_thread,
             dynamic_tools,
+            override_dynamic_tools,
             metrics_service_name,
             parent_trace,
             environments: environment_requests,
@@ -2529,6 +2537,9 @@ impl ThreadManagerState {
             mut reserved_thread_id,
             disabled_plugin_ids,
         } = options;
+        if override_dynamic_tools {
+            thread_extension_init.insert(OverrideDynamicTools);
+        }
         if resume_preparation.is_some()
             && (config.ephemeral || !matches!(&initial_history, InitialHistory::Resumed(_)))
         {
