@@ -102,6 +102,8 @@ e2e AVL agent с Codex (`scripts/e2e.sh codex`) проходит на форке
 
 - `thread/resume.dynamicTools` (`ThreadResumeParams.dynamic_tools` + `StartThreadOptions.override_dynamic_tools`): позволяет обновлять каталог динамических инструментов (включая очистку до пустого списка `[]`) при `thread/resume`, когда пользователь включает/выключает MCP-серверы или скиллы в существующем чате.
 
+- Окно неизвестной модели без потолка (`model_info_from_slug`: `max_context_window: None`): заданный `model_context_window` применяется как есть, а не режется до 272k — у моделей AVL окно до 1M; без настройки по умолчанию по-прежнему 272k. Порог автокомпакции AVL задаёт сам (`model_auto_compact_token_limit` = 80% окна, AVLAGENT-55).
+
 ## Что ещё можно вырезать (не сделано)
 
 Кандидаты, которые либо относятся к механике агента, либо глубоко вплетены — резать только

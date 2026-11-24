@@ -279,3 +279,18 @@ fn model_context_window_uses_model_value_without_override() {
 
     assert_eq!(updated, model);
 }
+
+#[test]
+fn unknown_model_takes_configured_context_window_without_ceiling() {
+    let config = ModelsManagerConfig {
+        model_context_window: Some(1_048_576),
+        model_auto_compact_token_limit: Some(838_860),
+        ..Default::default()
+    };
+
+    let updated = with_config_overrides(model_info_from_slug("unknown-model"), &config);
+
+    assert_eq!(updated.context_window, Some(1_048_576));
+    assert_eq!(updated.auto_compact_token_limit(), Some(838_860));
+    assert_eq!(model_info_from_slug("unknown-model").resolved_context_window(), Some(272_000));
+}
